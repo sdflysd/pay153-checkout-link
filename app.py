@@ -9,6 +9,8 @@ import os
 import re
 import secrets
 import random
+import shutil
+import subprocess
 import threading
 import time
 import unicodedata
@@ -17,7 +19,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 from flask import Flask, jsonify, redirect, request, send_from_directory
 from curl_cffi import requests
@@ -30,10 +32,13 @@ from upi_go_runner import available as upi_go_available, run_upi as run_upi_go
 from ph_short_extractor import (
     CheckoutExtractor as PhShortCheckoutExtractor,
     ExtractorConfig as PhShortExtractorConfig,
+    PAYMENT_COOKIE_NAMES as PH_PAYMENT_COOKIE_NAMES,
     checkout_amount_minor as custom_checkout_amount_minor,
     checkout_currency as custom_checkout_currency,
     checkout_state_from_html as custom_checkout_state_from_html,
+    filter_payment_cookie_header as filter_chatgpt_cookie_header,
     parse_credentials as parse_ph_short_credentials,
+    refresh_cookie_header as refresh_chatgpt_cookie_header,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -60,6 +65,26 @@ DYNAMIC_PROXY_API_LAST_AT = 0.0
 DYNAMIC_PROXY_API_MIN_INTERVAL = max(
     0.1, float(os.getenv("PAY153_DYNAMIC_PROXY_MIN_INTERVAL") or 0.35)
 )
+NON_RETRYABLE_CHECKOUT_ERROR_MARKERS = (
+    "access token",
+    "token_invalidated",
+    "token_expired",
+    "token_revoked",
+    "jwt expired",
+    "计划类型",
+    "提取方式",
+    "任务已停止",
+    "custom_confirm_blocked",
+    "manual_approval approve blocked",
+    "result=blocked",
+    "\"status\":\"blocked\"",
+    "'status':'blocked'",
+)
+
+
+def is_non_retryable_checkout_error(message: str) -> bool:
+    lowered = str(message or "").lower().replace(" ", "")
+    return any(marker.replace(" ", "") in lowered for marker in NON_RETRYABLE_CHECKOUT_ERROR_MARKERS)
 
 
 def _ascii_key(value: Any) -> str:
@@ -159,7 +184,7 @@ def default_entry_proxy_country(link_type: str, country: str) -> str:
     country = str(country or "US").upper()
     if link_type == "kakao":
         return "VN"
-    if link_type in {"gcash", "ph_short"} and country == "PH":
+    if link_type == "ph_short" and country == "PH":
         return "US"
     return country
 
@@ -286,6 +311,18 @@ def normalize_hosted_checkout_url(url: str, session_id: str = "") -> str:
     return value
 
 
+def gcash_preselected_checkout_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return value
+    parsed = urlsplit(value)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["redirect_pm_type"] = "external_gcash"
+    query.setdefault("ui_mode", "custom")
+    query.setdefault("lid", str(uuid.uuid4()))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
 PLANS = {
     "plus": "chatgptplusplan",
     "pro": "chatgptpro",
@@ -355,9 +392,23 @@ def normalize_paypal_checkout_region(country: str, detected_currency: str = "") 
 
 
 class ProxySentinel(BaseSentinel):
-    def __init__(self, proxy: str | None, cookies: dict[str, str]):
-        super().__init__(impersonate="firefox144", cookies=cookies)
+    def __init__(
+        self,
+        proxy: str | None,
+        cookies: dict[str, str],
+        *,
+        impersonate: str = "firefox144",
+        user_agent: str = "",
+        language: str = "en-US",
+    ):
+        super().__init__(
+            impersonate=impersonate or "firefox144",
+            cookies=cookies,
+            user_agent=user_agent or sc.CHROME_UA,
+            language=language or "en-US",
+        )
         self.proxy = proxy
+        self.impersonate = impersonate or "firefox144"
         sentinel_backend = str(
             os.getenv("PAY153_SENTINEL_BACKEND_URL")
             or "https://chatgpt.com/backend-api/sentinel/"
@@ -367,7 +418,7 @@ class ProxySentinel(BaseSentinel):
 
     async def _get_session(self):
         if not self._session:
-            kwargs: dict[str, Any] = {"impersonate": "firefox144", "timeout": 70}
+            kwargs: dict[str, Any] = {"impersonate": self.impersonate, "timeout": 70}
             if self.proxy:
                 kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
             self._session = requests.AsyncSession(**kwargs)
@@ -383,19 +434,233 @@ def _decode_jwt(token: str) -> dict:
         return {}
 
 
+CHATGPT_COOKIE_NAMES = tuple(
+    sorted(
+        set(PH_PAYMENT_COOKIE_NAMES)
+        | {
+            "__Host-next-auth.csrf-token",
+            "__Secure-next-auth.callback-url",
+            "__Secure-next-auth.csrf-token",
+        }
+    )
+)
+SESSION_COOKIE_VALUE_KEYS = {
+    "chatgpt_session_cookie",
+    "chatgptsessioncookie",
+    "session_cookie",
+    "sessioncookie",
+    "sessiontoken",
+    "__secure-next-auth.session-token",
+}
+COOKIE_CONTAINER_KEYS = {
+    "cookies",
+    "cookie",
+    "cookiejar",
+    "cookiestore",
+    "session_cookies",
+    "sessioncookies",
+}
+COOKIE_NAME_FIELD_KEYS = ("name", "Name", "key", "Key")
+COOKIE_VALUE_FIELD_KEYS = ("value", "Value", "val", "Val")
+CHROME_CDP_DEFAULT_URL = str(os.getenv("PAY153_CHROME_CDP_URL") or "http://127.0.0.1:9222").strip()
+
+
+def _find_payload_value(payload: Any, keys: tuple[str, ...]) -> str:
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            found = _find_payload_value(value, keys)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_payload_value(value, keys)
+            if found:
+                return found
+    return ""
+
+
+def _clean_cookie_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return text
+
+
+def _add_chatgpt_cookie(cookies: dict[str, str], name: Any, value: Any) -> None:
+    cookie_name = str(name or "").strip()
+    cookie_value = _clean_cookie_value(value)
+    if cookie_name in CHATGPT_COOKIE_NAMES and cookie_value:
+        cookies[cookie_name] = cookie_value
+
+
+def _cookies_from_header_text(value: Any, *, bare_token_is_session: bool = False) -> dict[str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    if bare_token_is_session and "=" not in text.split(";", 1)[0]:
+        return {"__Secure-next-auth.session-token": text}
+    cookies: dict[str, str] = {}
+    for line in re.split(r"[\r\n]+", text):
+        cleaned = re.sub(r"^\s*(?:cookie|set-cookie)\s*:\s*", "", line.strip(), flags=re.I)
+        for item in cleaned.split(";"):
+            name, separator, cookie_value = item.strip().partition("=")
+            if separator:
+                _add_chatgpt_cookie(cookies, name, cookie_value)
+        for cookie_name in CHATGPT_COOKIE_NAMES:
+            pattern = rf"(?:^|[;,\s]){re.escape(cookie_name)}=([^;,\r\n]+)"
+            for match in re.finditer(pattern, cleaned):
+                _add_chatgpt_cookie(cookies, cookie_name, match.group(1))
+    return cookies
+
+
+def _extract_chatgpt_cookies_from_payload(payload: Any) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+
+    def collect(value: Any, key_hint: str = "") -> None:
+        if isinstance(value, dict):
+            name = next((value.get(key) for key in COOKIE_NAME_FIELD_KEYS if value.get(key)), "")
+            cookie_value = next((value.get(key) for key in COOKIE_VALUE_FIELD_KEYS if value.get(key)), "")
+            if name and cookie_value:
+                _add_chatgpt_cookie(cookies, name, cookie_value)
+            for key, item in value.items():
+                key_text = str(key or "").strip()
+                key_lower = key_text.lower()
+                if isinstance(item, str):
+                    if key_text in CHATGPT_COOKIE_NAMES:
+                        _add_chatgpt_cookie(cookies, key_text, item)
+                    elif key_lower in SESSION_COOKIE_VALUE_KEYS:
+                        cookies.update(_cookies_from_header_text(item, bare_token_is_session=True))
+                    elif "cookie" in key_lower:
+                        cookies.update(_cookies_from_header_text(item))
+                if key_lower in COOKIE_CONTAINER_KEYS or isinstance(item, (dict, list)):
+                    collect(item, key_text)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, key_hint)
+
+    collect(payload)
+    return cookies
+
+
+def _cookie_header_from_dict(cookies: dict[str, str], did: str = "") -> str:
+    clean = {
+        str(name): _clean_cookie_value(value)
+        for name, value in (cookies or {}).items()
+        if str(name) in CHATGPT_COOKIE_NAMES and _clean_cookie_value(value)
+    }
+    if did:
+        clean["oai-did"] = str(did)
+    header = "; ".join(f"{name}={value}" for name, value in clean.items())
+    return filter_chatgpt_cookie_header(header) or header
+
+
+def chatgpt_cookie_names(meta: dict[str, Any]) -> list[str]:
+    cookies = meta.get("_chatgpt_cookies") if isinstance(meta, dict) else {}
+    if not isinstance(cookies, dict):
+        return []
+    return sorted(str(name) for name, value in cookies.items() if value)
+
+
+def chatgpt_cookie_did(meta: dict[str, Any]) -> str:
+    cookies = meta.get("_chatgpt_cookies") if isinstance(meta, dict) else {}
+    if not isinstance(cookies, dict):
+        return ""
+    return str(cookies.get("oai-did") or "").strip()
+
+
+def has_chatgpt_session_cookie(meta: dict[str, Any]) -> bool:
+    cookies = meta.get("_chatgpt_cookies") if isinstance(meta, dict) else {}
+    return isinstance(cookies, dict) and bool(cookies.get("__Secure-next-auth.session-token"))
+
+
+def apply_chatgpt_cookies(http: Any, meta: dict[str, Any], did: str) -> str:
+    if http is None:
+        return ""
+    apply_chatgpt_browser_environment(http, meta)
+    cookies = meta.get("_chatgpt_cookies") if isinstance(meta, dict) else {}
+    if not isinstance(cookies, dict):
+        cookies = {}
+    header = _cookie_header_from_dict(cookies, did)
+    if not header:
+        return ""
+    try:
+        for item in header.split(";"):
+            name, separator, value = item.strip().partition("=")
+            if separator and name:
+                http.cookies.set(name, value, domain="chatgpt.com")
+    except Exception:
+        pass
+    try:
+        http.headers["Cookie"] = header
+    except Exception:
+        pass
+    return header
+
+
+def refresh_applied_chatgpt_cookies(http: Any, meta: dict[str, Any], did: str) -> str:
+    fallback = apply_chatgpt_cookies(http, meta, did)
+    try:
+        refresh_chatgpt_cookie_header(http, fallback)
+    except Exception:
+        pass
+    try:
+        return str(http.headers.get("Cookie") or fallback or "")
+    except Exception:
+        return fallback
+
+
+def attach_chatgpt_cookie_header(http: Any, headers: dict[str, str]) -> dict[str, str]:
+    out = dict(headers)
+    try:
+        session_headers = getattr(http, "headers", {})
+    except Exception:
+        session_headers = {}
+    try:
+        user_agent = str(session_headers.get("User-Agent") or "").strip()
+        if user_agent:
+            out["User-Agent"] = user_agent
+        accept_language = str(session_headers.get("Accept-Language") or "").strip()
+        if accept_language:
+            out["Accept-Language"] = accept_language
+        for key in ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"):
+            value = str(session_headers.get(key) or "").strip()
+            if value:
+                out[key] = value
+    except Exception:
+        pass
+    try:
+        cookie_header = str(session_headers.get("Cookie") or "").strip()
+    except Exception:
+        cookie_header = ""
+    if cookie_header and "Cookie" not in out:
+        out["Cookie"] = cookie_header
+    return out
+
+
 def extract_access_token(raw: str) -> tuple[str, dict]:
     raw = str(raw or "").strip()
     if not raw:
         raise ValueError("请填写 Access Token 或 Session JSON")
     token = ""
     meta: dict[str, Any] = {}
-    if raw.startswith("{"):
+    payload: Any = None
+    if raw.startswith(("{", "[")):
         data = json.loads(raw)
-        token = str(data.get("accessToken") or data.get("access_token") or "")
-        account = data.get("account") or {}
+        payload = data
+        token = _find_payload_value(data, ("accessToken", "access_token", "token"))
+        account = data.get("account") if isinstance(data, dict) else {}
         if isinstance(account, dict):
             meta.update(account)
+        cookies = _extract_chatgpt_cookies_from_payload(data)
+        if cookies:
+            meta["_chatgpt_cookies"] = cookies
     if not token:
+        if payload is not None:
+            raise ValueError("Session JSON 未包含 Access Token")
         match = re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", raw)
         token = match.group(0) if match else raw.splitlines()[0].strip()
     if token.count(".") < 2:
@@ -410,6 +675,258 @@ def extract_access_token(raw: str) -> tuple[str, dict]:
     if meta.get("exp") and int(meta["exp"]) <= int(time.time()):
         raise ValueError("Access Token 已过期")
     return token, meta
+
+
+def merge_chrome_cdp_credentials(
+    token: str,
+    meta: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> tuple[str, dict[str, Any], bool]:
+    if not isinstance(snapshot, dict) or not snapshot.get("ok"):
+        return token, meta, False
+    cdp_token = str(snapshot.get("accessToken") or "").strip()
+    if cdp_token.count(".") < 2:
+        return token, meta, False
+    cdp_cookies = _extract_chatgpt_cookies_from_payload(snapshot)
+    if not cdp_cookies.get("__Secure-next-auth.session-token"):
+        return token, meta, False
+    merged = dict(meta or {})
+    merged["_chatgpt_cookies"] = cdp_cookies
+    cdp_claims = _decode_jwt(cdp_token)
+    account = snapshot.get("account") if isinstance(snapshot.get("account"), dict) else {}
+    user = snapshot.get("user") if isinstance(snapshot.get("user"), dict) else {}
+    merged.update({
+        "email": cdp_claims.get("email") or user.get("email") or account.get("email") or merged.get("email") or "",
+        "exp": cdp_claims.get("exp") or merged.get("exp"),
+        "account_id": (cdp_claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+            or account.get("id") or merged.get("account_id") or "",
+        "_chrome_cdp_session": {
+            "url": str(snapshot.get("pageUrl") or ""),
+            "title": str(snapshot.get("pageTitle") or ""),
+            "user_agent": str(snapshot.get("userAgent") or ""),
+            "language": str(snapshot.get("language") or ""),
+            "time_zone": str(snapshot.get("timeZone") or ""),
+            "cookie_names": sorted(cdp_cookies.keys()),
+        },
+    })
+    return cdp_token, merged, True
+
+
+def read_chrome_cdp_session(cdp_url: str = "") -> dict[str, Any]:
+    cdp_url = str(cdp_url or CHROME_CDP_DEFAULT_URL or "").rstrip("/")
+    if not cdp_url:
+        return {"ok": False, "error": "chrome cdp url is empty"}
+    node = shutil.which("node")
+    script = ROOT / "tools" / "chrome_cdp_session.js"
+    if not node:
+        return {"ok": False, "error": "node not found"}
+    if not script.exists():
+        return {"ok": False, "error": "chrome cdp helper missing"}
+    try:
+        completed = subprocess.run(
+            [node, str(script), cdp_url],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if completed.returncode != 0:
+        return {"ok": False, "error": (completed.stderr or completed.stdout or "").strip()[:300]}
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except Exception as exc:
+        return {"ok": False, "error": f"invalid helper json: {type(exc).__name__}"}
+    return payload if isinstance(payload, dict) else {"ok": False, "error": "invalid helper payload"}
+
+
+CHROME_CDP_FETCH_FORBIDDEN_HEADERS = {
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "cookie",
+    "host",
+    "origin",
+    "referer",
+    "user-agent",
+}
+
+
+def chrome_cdp_fetch_headers(headers: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        name = str(key or "").strip()
+        lower = name.lower()
+        if (
+            not name
+            or lower in CHROME_CDP_FETCH_FORBIDDEN_HEADERS
+            or lower.startswith("sec-")
+            or lower.startswith("proxy-")
+            or value in (None, "")
+        ):
+            continue
+        out[name] = str(value)
+    return out
+
+
+def chrome_cdp_confirm_fallback_enabled() -> bool:
+    return str(os.getenv("PAY153_CHROME_CDP_CONFIRM_FALLBACK", "1")).strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def chrome_cdp_confirm_primary_enabled(payment_method_type: str, confirmation_token: str = "") -> bool:
+    override = str(os.getenv("PAY153_CHROME_CDP_CONFIRM_PRIMARY") or "").strip().lower()
+    if override:
+        return override not in {"0", "false", "no", "off"}
+    return bool(str(confirmation_token or "").strip()) and not str(payment_method_type or "").startswith("cpmt_")
+
+
+def chrome_cdp_fetch_json(
+    *,
+    url: str,
+    method: str,
+    body: dict[str, Any],
+    headers: dict[str, Any],
+    referrer: str,
+    page_url: str = "",
+    select_payment_method: str = "",
+    timeout_ms: int = 25000,
+    cdp_url: str = "",
+) -> dict[str, Any]:
+    cdp_url = str(cdp_url or CHROME_CDP_DEFAULT_URL or "").rstrip("/")
+    if not cdp_url:
+        return {"_helper_ok": False, "error": "chrome cdp url is empty"}
+    node = shutil.which("node")
+    script = ROOT / "tools" / "chrome_cdp_fetch.js"
+    if not node:
+        return {"_helper_ok": False, "error": "node not found"}
+    if not script.exists():
+        return {"_helper_ok": False, "error": "chrome cdp fetch helper missing"}
+    request_payload = {
+        "cdpUrl": cdp_url,
+        "url": url,
+        "method": method,
+        "body": body or {},
+        "headers": chrome_cdp_fetch_headers(headers),
+        "referrer": referrer or "https://chatgpt.com/",
+        "pageUrl": page_url or referrer or "https://chatgpt.com/",
+        "selectPaymentMethod": select_payment_method,
+        "timeoutMs": timeout_ms,
+    }
+    try:
+        completed = subprocess.run(
+            [node, str(script), "-"],
+            cwd=str(ROOT),
+            input=json.dumps(request_payload, ensure_ascii=False, separators=(",", ":")),
+            capture_output=True,
+            text=True,
+            timeout=max(8, int(timeout_ms / 1000) + 6),
+            check=False,
+        )
+    except Exception as exc:
+        return {"_helper_ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if completed.returncode != 0:
+        return {"_helper_ok": False, "error": (completed.stderr or completed.stdout or "").strip()[:300]}
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except Exception as exc:
+        return {"_helper_ok": False, "error": f"invalid helper json: {type(exc).__name__}"}
+    if not isinstance(payload, dict):
+        return {"_helper_ok": False, "error": "invalid helper payload"}
+    payload["_helper_ok"] = True
+    return payload
+
+
+def auto_enrich_credentials_from_chrome_cdp(
+    token: str,
+    meta: dict[str, Any],
+    log,
+) -> tuple[str, dict[str, Any]]:
+    if has_chatgpt_session_cookie(meta):
+        return token, meta
+    if str(os.getenv("PAY153_CHROME_CDP_AUTO", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return token, meta
+    snapshot = read_chrome_cdp_session()
+    new_token, new_meta, changed = merge_chrome_cdp_credentials(token, meta, snapshot)
+    if changed:
+        names = ",".join(chatgpt_cookie_names(new_meta))
+        log(f"已从 Chrome 9222 补齐 ChatGPT 登录态：{names}")
+        cdp_meta = new_meta.get("_chrome_cdp_session") or {}
+        if isinstance(cdp_meta, dict) and cdp_meta.get("user_agent"):
+            log(f"Chrome 9222 环境：{str(cdp_meta.get('user_agent'))[:90]}")
+        return new_token, new_meta
+    error = str(snapshot.get("error") or "未读取到完整 Chrome 登录态") if isinstance(snapshot, dict) else "未读取到完整 Chrome 登录态"
+    log(f"Chrome 9222 登录态补齐失败：{error[:180]}")
+    return token, meta
+
+
+def chatgpt_browser_meta(meta: dict[str, Any]) -> dict[str, str]:
+    env = meta.get("_chrome_cdp_session") if isinstance(meta, dict) else {}
+    if not isinstance(env, dict):
+        env = {}
+    return {
+        "user_agent": str(env.get("user_agent") or sc.CHROME_UA).strip() or sc.CHROME_UA,
+        "language": str(env.get("language") or "en-US").strip() or "en-US",
+        "time_zone": str(env.get("time_zone") or "").strip(),
+    }
+
+
+def chatgpt_impersonate(meta: dict[str, Any]) -> str:
+    override = str(os.getenv("PAY153_CHATGPT_IMPERSONATE") or "").strip()
+    if override:
+        return override
+    user_agent = chatgpt_browser_meta(meta).get("user_agent", "")
+    if "Chrome/" in user_agent or "Chromium/" in user_agent or "Edg/" in user_agent:
+        return "chrome146"
+    if "Firefox/" in user_agent:
+        return "firefox144"
+    return "firefox144"
+
+
+def _chrome_major_from_ua(user_agent: str) -> str:
+    match = re.search(r"(?:Chrome|Chromium|Edg)/(\d+)", str(user_agent or ""))
+    return match.group(1) if match else ""
+
+
+def apply_chatgpt_browser_environment(http: Any, meta: dict[str, Any]) -> None:
+    if http is None:
+        return
+    browser = chatgpt_browser_meta(meta)
+    ua = browser["user_agent"]
+    language = browser["language"]
+    try:
+        http.headers["User-Agent"] = ua
+        http.headers["Accept-Language"] = f"{language},{language.split('-', 1)[0]};q=0.9,en;q=0.8"
+        major = _chrome_major_from_ua(ua)
+        if major:
+            http.headers["sec-ch-ua"] = f'"Google Chrome";v="{major}", "Chromium";v="{major}", "Not_A Brand";v="99"'
+            http.headers["sec-ch-ua-mobile"] = "?0"
+            http.headers["sec-ch-ua-platform"] = '"Windows"'
+    except Exception:
+        pass
+
+
+def chatgpt_user_agent_for_session(http: Any) -> str:
+    try:
+        value = str(getattr(http, "headers", {}).get("User-Agent") or "").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return sc.CHROME_UA
+
+
+def chatgpt_language_for_session(http: Any) -> str:
+    try:
+        value = str(getattr(http, "headers", {}).get("Accept-Language") or "").strip()
+        if value:
+            return value
+    except Exception:
+        pass
+    return "zh-CN,zh;q=0.9,en;q=0.8"
 
 
 def normalize_proxy(raw: str) -> str:
@@ -630,12 +1147,28 @@ async def sentinel_headers(
     *,
     use_sen: bool = True,
     use_so: bool = True,
+    cookies: dict[str, str] | None = None,
+    user_agent: str = "",
+    language: str = "en-US",
+    impersonate: str = "firefox144",
 ) -> dict[str, str]:
     if not use_sen and not use_so:
         return {}
     last_error = "empty token"
     for attempt in range(2):
-        provider = ProxySentinel(proxy or None, {"oai-did": cookie})
+        sentinel_cookies = {
+            str(name): _clean_cookie_value(value)
+            for name, value in (cookies or {}).items()
+            if str(name) in CHATGPT_COOKIE_NAMES and _clean_cookie_value(value)
+        }
+        sentinel_cookies["oai-did"] = cookie
+        provider = ProxySentinel(
+            proxy or None,
+            sentinel_cookies,
+            impersonate=impersonate or "firefox144",
+            user_agent=user_agent or sc.CHROME_UA,
+            language=language or "en-US",
+        )
         try:
             token, so, diag = await provider.get_token_pair(flow, device_id)
             init_error = str(diag.get("init_error") or getattr(provider, "_last_init_error", "") or "")
@@ -678,7 +1211,9 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
         "plan_name": PLANS[plan],
         "billing_details": billing,
         "cancel_url": "https://chatgpt.com/",
-        "checkout_ui_mode": "custom" if options["link_type"] != "hosted" else "redirect",
+        "checkout_ui_mode": (
+            "redirect" if options["link_type"] in {"hosted", "gcash"} else "custom"
+        ),
         "check_card_proxy": True,
     }
     promo = options.get("promo_campaign", "").strip()
@@ -724,22 +1259,38 @@ def create_checkout(
     *,
     use_sen: bool = True,
     use_so: bool = True,
+    credential_meta: dict[str, Any] | None = None,
 ) -> dict:
-    http = sc.build_http(proxy or None)
-    try:
-        http.cookies.set("oai-did", did, domain="chatgpt.com")
-    except Exception:
-        pass
+    credential_meta = credential_meta or {}
+    http = sc.build_http(proxy or None, impersonate=chatgpt_impersonate(credential_meta))
+    refresh_applied_chatgpt_cookies(http, credential_meta, did)
     try:
         http.get(
             "https://chatgpt.com/api/auth/csrf",
-            headers={"User-Agent": sc.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+            headers=attach_chatgpt_cookie_header(
+                http,
+                {"User-Agent": sc.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+            ),
             timeout=20,
         )
+        refresh_applied_chatgpt_cookies(http, credential_meta, did)
     except Exception as exc:
         log(f"ChatGPT 暖身提示：{type(exc).__name__}")
+    credential_cookies = _cookies_from_header_text(
+        str(getattr(http, "headers", {}).get("Cookie") or "")
+    )
+    if not credential_cookies:
+        credential_cookies = credential_meta.get("_chatgpt_cookies")
+        if not isinstance(credential_cookies, dict):
+            credential_cookies = {}
     s_headers = asyncio.run(sentinel_headers(
-        proxy, "chatgpt_checkout", device_id, did, use_sen=use_sen, use_so=use_so,
+        proxy, "chatgpt_checkout", device_id, did,
+        use_sen=use_sen,
+        use_so=use_so,
+        cookies=credential_cookies,
+        user_agent=chatgpt_user_agent_for_session(http),
+        language=chatgpt_browser_meta(credential_meta)["language"],
+        impersonate=chatgpt_impersonate(credential_meta),
     ))
     headers = {
         "Authorization": f"Bearer {token}",
@@ -753,7 +1304,12 @@ def create_checkout(
         "OAI-Device-Id": device_id,
         **s_headers,
     }
-    resp = http.post(sc.OPENAI_CHECKOUT_URL, json=payload, headers=headers, timeout=60)
+    resp = http.post(
+        sc.OPENAI_CHECKOUT_URL,
+        json=payload,
+        headers=attach_chatgpt_cookie_header(http, headers),
+        timeout=60,
+    )
     text = resp.text or ""
     if resp.status_code != 200:
         raise RuntimeError(f"OpenAI Checkout HTTP {resp.status_code}: {text[:500]}")
@@ -1078,7 +1634,7 @@ def update_checkout_promo(
     resp = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/update",
         json=body,
-        headers={
+        headers=attach_chatgpt_cookie_header(http, {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "*/*",
@@ -1090,7 +1646,7 @@ def update_checkout_promo(
             "OAI-Device-Id": device_id,
             "x-openai-target-path": "/backend-api/payments/checkout/update",
             "x-openai-target-route": "/backend-api/payments/checkout/update",
-        },
+        }),
         timeout=45,
     )
     text = resp.text or ""
@@ -1112,13 +1668,13 @@ def fetch_custom_checkout_session(
 ) -> dict[str, Any]:
     resp = http.get(
         f"https://chatgpt.com/backend-api/payments/checkout/{processor_entity}/{session_id}",
-        headers={
+        headers=attach_chatgpt_cookie_header(http, {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
             "User-Agent": sc.CHROME_UA,
             "OAI-Device-Id": device_id,
-        },
+        }),
         timeout=45,
     )
     text = resp.text or ""
@@ -1160,7 +1716,7 @@ def submit_custom_checkout_taxes(
             "processor_entity": processor_entity,
             "billing_address": clean_address,
         },
-        headers={
+        headers=attach_chatgpt_cookie_header(http, {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -1170,7 +1726,7 @@ def submit_custom_checkout_taxes(
             "OAI-Device-Id": device_id,
             "x-openai-target-path": "/backend-api/payments/checkout/taxes",
             "x-openai-target-route": "/backend-api/payments/checkout/taxes",
-        },
+        }),
         timeout=50,
     )
     text = resp.text or ""
@@ -1225,12 +1781,46 @@ def custom_checkout_method_is_custom(method_id: str) -> bool:
     return str(method_id or "").startswith("cpmt_")
 
 
+def custom_checkout_method_is_external(method_id: str) -> bool:
+    return _ascii_key(method_id).startswith("external_")
+
+
+def custom_payment_method_external_identifier(method: Any) -> str:
+    if isinstance(method, str):
+        value = method.strip()
+        return value if custom_checkout_method_is_external(value) else ""
+    if not isinstance(method, dict):
+        return ""
+    for key in (
+        "external_payment_method_type",
+        "externalPaymentMethodType",
+        "payment_method_type",
+        "paymentMethodType",
+        "type",
+        "value",
+        "code",
+        "id",
+    ):
+        value = method.get(key)
+        if isinstance(value, str) and custom_checkout_method_is_external(value):
+            return value.strip()
+    return ""
+
+
 def extract_custom_checkout_methods(data: Any) -> list[Any]:
     method_keys = {
         "custom_payment_methods",
         "customPaymentMethods",
         "custom_payment_method_types",
         "customPaymentMethodTypes",
+        "external_payment_methods",
+        "externalPaymentMethods",
+        "external_payment_method_types",
+        "externalPaymentMethodTypes",
+        "external_payment_method_specs",
+        "externalPaymentMethodSpecs",
+        "payment_method_specs",
+        "paymentMethodSpecs",
         "payment_method_types",
         "paymentMethodTypes",
         "payment_methods",
@@ -1331,13 +1921,75 @@ def select_custom_checkout_method(methods: Any, provider: str) -> str:
                 return method_id
 
     if provider == "gcash":
+        ranked: list[tuple[int, str]] = []
         for item in candidates:
             method_id = custom_payment_method_identifier(item)
-            if "gcash" in custom_payment_method_text(item):
-                return method_id
-        return custom_payment_method_identifier(candidates[0])
+            external_id = custom_payment_method_external_identifier(item)
+            text = custom_payment_method_text(item)
+            if "gcash" in text:
+                if method_id.startswith("cpmt_"):
+                    ranked.append((0, method_id))
+                elif external_id:
+                    ranked.append((1, external_id))
+                else:
+                    ranked.append((3, method_id))
+            elif (
+                method_id.startswith("cpmt_")
+                and len(candidates) == 1
+                and not any(blocked in text for blocked in ("card", "link", "paypal", "kakao", "naver"))
+            ):
+                ranked.append((5, method_id))
+        ranked.sort(key=lambda pair: pair[0])
+        if ranked:
+            return ranked[0][1]
+
+        anonymous_custom_methods: list[str] = []
+        generic_method_ids = {"card", "link"}
+        blocked_custom_labels = {
+            "card", "link", "paypal", "kakao", "naver", "gopay", "grabpay",
+            "paymaya", "maya", "pix", "momo", "upi", "ideal", "twint",
+        }
+        ambiguous_non_generic = False
+        for item in candidates:
+            method_id = custom_payment_method_identifier(item)
+            normalized_id = _ascii_key(method_id)
+            text = custom_payment_method_text(item)
+            if method_id.startswith("cpmt_"):
+                if not any(blocked in text for blocked in blocked_custom_labels):
+                    anonymous_custom_methods.append(method_id)
+                continue
+            if normalized_id not in generic_method_ids:
+                ambiguous_non_generic = True
+        if len(anonymous_custom_methods) == 1 and not ambiguous_non_generic:
+            return anonymous_custom_methods[0]
+        return ""
 
     return custom_payment_method_identifier(candidates[0])
+
+
+def select_custom_checkout_method_from_states(provider: str, *states: Any) -> str:
+    for state in states:
+        method_id = select_custom_checkout_method(state, provider)
+        if method_id:
+            return method_id
+    return ""
+
+
+def checkout_amount_verification(amount: Any) -> str:
+    return "verified_zero" if amount == 0 else ("pending" if amount is None else "nonzero")
+
+
+def gcash_done_text(base_text: str, promo_requested: bool, amount_verification: str) -> str:
+    if promo_requested and amount_verification == "nonzero":
+        return f"{base_text}，优惠未生效，请确认页面金额"
+    return base_text
+
+
+def gcash_page_fallback_allowed(options: dict[str, Any]) -> bool:
+    value = options.get("allow_gcash_page_fallback")
+    if value is None:
+        value = os.getenv("PAY153_ALLOW_GCASH_PAGE_FALLBACK", "")
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def checkout_redirect_url_from_payload(payload: Any) -> str:
@@ -1359,9 +2011,41 @@ def checkout_redirect_url_from_payload(payload: Any) -> str:
     for candidate in candidates:
         host = urlsplit(candidate).netloc.lower()
         text = candidate.lower()
-        if any(marker in host or marker in text for marker in ("kakao", "nicepay", "stripe", "payment", "checkout")):
+        if any(marker in host or marker in text for marker in ("gcash", "kakao", "nicepay", "paypal", "stripe", "payment", "checkout")):
             return candidate
     return candidates[0] if candidates else ""
+
+
+def custom_checkout_confirm_return_url(
+    payload: Any,
+    session_id: str,
+    processor_entity: str,
+    plan_type: str = "plus",
+) -> str:
+    def walk(value: Any) -> str:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() == "confirm_return_url" and isinstance(item, str) and item.startswith("https://"):
+                    return item.strip()
+                found = walk(item)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
+        return ""
+
+    found = walk(payload)
+    if found:
+        return found
+    return (
+        "https://chatgpt.com/checkout/verify?"
+        f"stripe_session_id={quote(str(session_id or ''), safe='')}"
+        f"&processor_entity={quote(str(processor_entity or ''), safe='')}"
+        f"&plan_type={quote(str(plan_type or 'plus'), safe='')}"
+    )
 
 
 def create_stripe_confirmation_token(
@@ -1395,12 +2079,25 @@ def create_stripe_confirmation_token(
         "_stripe_version": sc.STRIPE_VERSION_FULL,
     }
     data = {key: value for key, value in data.items() if value not in (None, "")}
-    resp = http.post(
-        f"{sc.STRIPE_API}/v1/confirmation_tokens",
-        data=data,
-        headers=sc._stripe_headers(),
-        timeout=45,
-    )
+    last_exc: Exception | None = None
+    resp = None
+    for attempt in range(1, 4):
+        try:
+            resp = http.post(
+                f"{sc.STRIPE_API}/v1/confirmation_tokens",
+                data=data,
+                headers=sc._stripe_headers(),
+                timeout=45,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= 3:
+                raise
+            log(f"[stripe] {payment_method_type} confirmation_token 网络重试 {attempt}/2：{type(exc).__name__}")
+            time.sleep(0.7 * attempt)
+    if resp is None:
+        raise RuntimeError(f"创建 {payment_method_type} confirmation_token 失败：{last_exc}")
     text = getattr(resp, "text", "") or ""
     if getattr(resp, "status_code", 0) != 200:
         raise RuntimeError(
@@ -1418,17 +2115,80 @@ def create_stripe_confirmation_token(
     return token_id
 
 
+def custom_checkout_billing_details(billing: dict[str, Any] | None) -> dict[str, Any]:
+    source = billing or {}
+    addr = dict(source.get("address") or {})
+    address = {
+        "country": str(addr.get("country") or "").upper(),
+        "line1": str(addr.get("line1") or ""),
+        "line2": str(addr.get("line2") or ""),
+        "city": str(addr.get("city") or ""),
+        "state": str(addr.get("state") or ""),
+        "postal_code": str(addr.get("postal_code") or ""),
+    }
+    address = {key: value for key, value in address.items() if value not in (None, "")}
+    details = {
+        "name": str(source.get("name") or ""),
+        "email": str(source.get("email") or ""),
+        "address": address,
+    }
+    return {key: value for key, value in details.items() if value not in (None, "", {})}
+
+
+def custom_checkout_billing_is_complete(billing: dict[str, Any] | None) -> bool:
+    details = custom_checkout_billing_details(billing)
+    addr = details.get("address") if isinstance(details.get("address"), dict) else {}
+    required = [
+        details.get("name"),
+        addr.get("country"),
+        addr.get("line1"),
+        addr.get("city"),
+        addr.get("postal_code"),
+    ]
+    if str(addr.get("country") or "").upper() == "KR":
+        required.append(addr.get("state"))
+    return all(
+        str(value or "").strip()
+        for value in required
+    )
+
+
 def custom_checkout_confirm_body(
     session_id: str,
     payment_method_type: str,
     confirmation_token: str = "",
-) -> dict[str, str]:
-    body = {
+    billing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
         "checkout_session_id": session_id,
         "selected_payment_method_type": payment_method_type,
+        # The current official checkout frontend passes camelCase options into
+        # the Stripe/OpenAI custom checkout layer. Keep the legacy snake_case
+        # fields too, because older backend builds accepted those names.
+        "selectedPaymentMethodType": payment_method_type,
     }
     if confirmation_token:
+        body["type"] = "confirmation_token"
         body["confirm_token"] = confirmation_token
+        body["confirmToken"] = confirmation_token
+        body["confirmation_token"] = confirmation_token
+    elif custom_checkout_method_is_custom(payment_method_type):
+        body["type"] = "custom_payment_method"
+        body["custom_payment_method_type_id"] = payment_method_type
+    elif custom_checkout_method_is_external(payment_method_type):
+        body["type"] = "external_payment_method"
+        body["external_payment_method_type"] = payment_method_type
+        body["externalPaymentMethodType"] = payment_method_type
+    else:
+        body["type"] = "payment_method"
+    billing_details = custom_checkout_billing_details(billing)
+    if billing_details:
+        body["billing_details"] = billing_details
+        body["payment_method_data"] = {"billing_details": billing_details}
+        body["billingAddress"] = {
+            "name": billing_details.get("name", ""),
+            "address": billing_details.get("address", {}),
+        }
     return body
 
 
@@ -1446,31 +2206,109 @@ def confirm_custom_checkout_method(
     use_so: bool = True,
     method_name: str = "GCash",
     confirmation_token: str = "",
+    billing: dict[str, Any] | None = None,
+    log=None,
 ) -> dict[str, Any]:
-    sentinel = asyncio.run(sentinel_headers(
-        proxy, "checkout_session_approval", device_id, did,
-        use_sen=use_sen, use_so=use_so,
-    ))
+    def detail(message: str) -> None:
+        if callable(log):
+            try:
+                log(message)
+            except Exception:
+                pass
+
     body = custom_checkout_confirm_body(
         session_id,
         custom_payment_method_id,
         confirmation_token,
+        billing,
     )
-    resp = http.post(
-        "https://chatgpt.com/backend-api/payments/checkout/confirm",
-        json=body,
-        headers={
+    confirm_url = "https://chatgpt.com/backend-api/payments/checkout/confirm"
+    confirm_referrer = f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
+
+    def build_confirm_headers() -> dict[str, str]:
+        sentinel_cookie_header = str(getattr(http, "headers", {}).get("Cookie") or "")
+        sentinel = asyncio.run(sentinel_headers(
+            proxy, "checkout_session_approval", device_id, did,
+            use_sen=use_sen, use_so=use_so,
+            cookies=_cookies_from_header_text(sentinel_cookie_header),
+            user_agent=chatgpt_user_agent_for_session(http),
+            language=chatgpt_language_for_session(http).split(",", 1)[0],
+            impersonate=("chrome146" if "Chrome/" in chatgpt_user_agent_for_session(http) else "firefox144"),
+        ))
+        return attach_chatgpt_cookie_header(http, {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Origin": "https://chatgpt.com",
-            "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+            "Referer": confirm_referrer,
             "User-Agent": sc.CHROME_UA,
             "OAI-Device-Id": device_id,
             "x-openai-target-path": "/backend-api/payments/checkout/confirm",
             "x-openai-target-route": "/backend-api/payments/checkout/confirm",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
             **sentinel,
-        },
+        })
+
+    def try_chrome_confirm(headers: dict[str, Any], label: str) -> tuple[dict[str, Any] | None, str]:
+        if not chrome_cdp_confirm_fallback_enabled():
+            return None, "Chrome fallback disabled"
+        fallback = chrome_cdp_fetch_json(
+            url=confirm_url,
+            method="POST",
+            body=body,
+            headers=headers,
+            referrer=confirm_referrer,
+            page_url=confirm_referrer,
+            select_payment_method=(
+                custom_payment_method_id
+                if str(custom_payment_method_id or "").lower() in {"kakao_pay", "naver_pay", "kr_card", "card"}
+                else ""
+            ),
+        )
+        if not fallback.get("_helper_ok"):
+            fallback_error = str(fallback.get("error") or "unknown")[:180]
+            detail(f"Chrome 9222 confirm {label} 未执行：{fallback_error}")
+            return None, f"Chrome {label} unavailable: {fallback_error}"
+        fallback_status = fallback.get("status") or 0
+        fallback_json = fallback.get("json") if isinstance(fallback.get("json"), dict) else {}
+        fallback_state = str((fallback_json or {}).get("status") or "").lower()
+        selection = fallback.get("selection") if isinstance(fallback.get("selection"), dict) else {}
+        if selection:
+            if selection.get("selected"):
+                detail(
+                    "Chrome 9222 confirm "
+                    f"{label} 前已点选 {selection.get('method')} "
+                    f"@{selection.get('x')},{selection.get('y')}"
+                )
+            else:
+                detail(
+                    "Chrome 9222 confirm "
+                    f"{label} 前点选支付方式未完成：{str(selection.get('reason') or 'unknown')[:120]}"
+                )
+        if fallback_state:
+            note = f"Chrome {label} HTTP {fallback_status} status={fallback_state}"
+        else:
+            fallback_error = str(fallback.get("error") or fallback.get("text") or "")[:160]
+            note = f"Chrome {label} HTTP {fallback_status} {fallback_error}"
+        detail(f"Chrome 9222 confirm {label}: HTTP {fallback_status} status={fallback_state or 'non-json'}")
+        if int(fallback_status or 0) == 200 and fallback_state == "success":
+            return fallback_json, note
+        return None, note
+
+    primary_note = ""
+    if chrome_cdp_confirm_primary_enabled(custom_payment_method_id, confirmation_token):
+        primary_payload, primary_note = try_chrome_confirm(build_confirm_headers(), "primary")
+        if primary_payload is not None:
+            return primary_payload
+
+    confirm_headers = build_confirm_headers()
+    resp = http.post(
+        confirm_url,
+        json=body,
+        headers=confirm_headers,
         timeout=50,
     )
     text = resp.text or ""
@@ -1483,8 +2321,13 @@ def confirm_custom_checkout_method(
     if str(payload.get("status") or "").lower() != "success":
         status = str(payload.get("status") or "unknown").lower()
         if status == "blocked":
+            fallback_payload, fallback_note = try_chrome_confirm(build_confirm_headers(), "fallback")
+            if fallback_payload is not None:
+                return fallback_payload
+            notes = "；".join(note for note in (primary_note, fallback_note) if note)
             raise RuntimeError(
-                f"CUSTOM_CONFIRM_BLOCKED: {method_name} 支付方式确认被上游拦截；{text[:300]}"
+                f"CUSTOM_CONFIRM_BLOCKED: {method_name} 支付方式确认被上游拦截；"
+                f"{text[:300]}" + (f"；{notes}" if notes else "")
             )
         raise RuntimeError(f"确认 {method_name} 支付方式失败：status={status}；{text[:300]}")
     return payload
@@ -1500,23 +2343,35 @@ def start_custom_checkout_method(
     *,
     method_name: str = "GCash",
 ) -> dict[str, Any]:
+    body = {
+        "checkout_session_id": session_id,
+        "custom_payment_method_type_id": custom_payment_method_id,
+    }
+    if custom_checkout_method_is_external(custom_payment_method_id):
+        body.update({
+            "external_payment_method_type": custom_payment_method_id,
+            "externalPaymentMethodType": custom_payment_method_id,
+            "selected_payment_method_type": custom_payment_method_id,
+            "selectedPaymentMethodType": custom_payment_method_id,
+        })
     resp = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/custom_payment_method/start",
-        json={
-            "checkout_session_id": session_id,
-            "custom_payment_method_type_id": custom_payment_method_id,
-        },
-        headers={
+        json=body,
+        headers=attach_chatgpt_cookie_header(http, {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Origin": "https://chatgpt.com",
             "Referer": f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
             "User-Agent": sc.CHROME_UA,
             "OAI-Device-Id": device_id,
             "x-openai-target-path": "/backend-api/payments/checkout/custom_payment_method/start",
             "x-openai-target-route": "/backend-api/payments/checkout/custom_payment_method/start",
-        },
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }),
         timeout=60,
     )
     text = resp.text or ""
@@ -1526,8 +2381,8 @@ def start_custom_checkout_method(
         payload = resp.json() or {}
     except Exception:
         raise RuntimeError(f"启动 {method_name} 支付返回非 JSON：{text[:300]}")
-    action = payload.get("next_action") or {}
-    if str(payload.get("status") or "").lower() != "requires_action" or not action.get("url"):
+    redirect_url = checkout_redirect_url_from_payload(payload)
+    if str(payload.get("status") or "").lower() != "requires_action" or not redirect_url:
         raise RuntimeError(f"{method_name} 未返回跳转链接：{text[:300]}")
     return payload
 
@@ -1542,22 +2397,36 @@ def approve_checkout(
     did: str,
     *,
     http=None,
+    credential_meta: dict[str, Any] | None = None,
     log=lambda _message: None,
 ) -> dict:
-    headers = asyncio.run(sentinel_headers(proxy, "checkout_session_approval", device_id, did))
-    http = http or sc.build_http(proxy or None)
-    try:
-        http.cookies.set("oai-did", did, domain="chatgpt.com")
-    except Exception:
-        pass
+    credential_meta = credential_meta or {}
+    http = http or sc.build_http(proxy or None, impersonate=chatgpt_impersonate(credential_meta))
+    cookie_header = refresh_applied_chatgpt_cookies(http, credential_meta, did)
+    credential_cookies = _cookies_from_header_text(cookie_header)
+    if not credential_cookies:
+        credential_cookies = credential_meta.get("_chatgpt_cookies")
+        if not isinstance(credential_cookies, dict):
+            credential_cookies = {}
+    headers = asyncio.run(sentinel_headers(
+        proxy,
+        "checkout_session_approval",
+        device_id,
+        did,
+        cookies=credential_cookies,
+        user_agent=chatgpt_user_agent_for_session(http),
+        language=chatgpt_browser_meta(credential_meta)["language"],
+        impersonate=chatgpt_impersonate(credential_meta),
+    ))
     body = {"checkout_session_id": session_id, "processor_entity": processor}
     resp = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/approve",
         json=body,
-        headers={
+        headers=attach_chatgpt_cookie_header(http, {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Origin": "https://chatgpt.com",
             "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
             "OAI-Device-Id": device_id,
@@ -1565,8 +2434,12 @@ def approve_checkout(
             "OAI-Language": "zh-CN",
             "x-openai-target-path": "/backend-api/payments/checkout/approve",
             "x-openai-target-route": "/backend-api/payments/checkout/approve",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            **({"Cookie": cookie_header} if cookie_header else {}),
             **headers,
-        },
+        }),
         timeout=40,
     )
     text = resp.text or ""
@@ -2398,7 +3271,24 @@ class JobStore:
             self.update(job_id, status="running", percent=6, text="解析 Access Token")
             raw_token = options.pop("token_raw")
             token, meta = extract_access_token(raw_token)
+            token, meta = auto_enrich_credentials_from_chrome_cdp(
+                token, meta, lambda message: self.log(job_id, message)
+            )
             self.ensure_not_cancelled(job_id)
+            cookie_names = chatgpt_cookie_names(meta)
+            if cookie_names:
+                self.log(job_id, "Session JSON 已携带 ChatGPT Cookie：{}".format(",".join(cookie_names)))
+                browser = chatgpt_browser_meta(meta)
+                self.log(
+                    job_id,
+                    "ChatGPT 请求环境：impersonate={}，language={}，ua={}".format(
+                        chatgpt_impersonate(meta),
+                        browser["language"],
+                        browser["user_agent"][:72],
+                    ),
+                )
+            else:
+                self.log(job_id, "当前凭据未携带 ChatGPT Cookie；如 approval 返回 blocked，请粘贴包含 Cookie 的完整 Session JSON")
             provider = options["link_type"]
             country = options["country"]
             entry_pool = options["entry_proxies"]
@@ -2415,7 +3305,9 @@ class JobStore:
             # Every outer retry creates a brand-new Checkout, so it must also
             # use a fresh browser/device identity.  Within this single attempt
             # the same ids are kept for create -> update -> approve.
-            device_id, did = str(uuid.uuid4()), str(uuid.uuid4())
+            credential_did = chatgpt_cookie_did(meta)
+            device_id = credential_did or str(uuid.uuid4())
+            did = device_id
 
             if provider == "ph_short":
                 short_country = country if country in {"PH", "GB", "US"} else "PH"
@@ -2512,10 +3404,10 @@ class JobStore:
             if provider == "gcash":
                 main_country, main_region = proxy_country(entry_proxy, options.get("entry_proxy_country"))
                 promo_proxy_country, promo_proxy_region = proxy_country(exit_proxy, options.get("exit_proxy_country"))
-                self.update(job_id, percent=9, text="校验 US Checkout 与优惠代理")
+                self.update(job_id, percent=9, text="校验 PH Checkout 与优惠代理")
                 self.log(job_id, f"GCash 路由：Checkout={main_country}/{main_region}，账单=PH/PHP，优惠更新={promo_proxy_country}/{promo_proxy_region}")
-                if main_country != "US":
-                    self.log(job_id, f"GCash Checkout 代理当前为 {main_country or '?'}；目标为 US，继续由上游校验")
+                if main_country != "PH":
+                    self.log(job_id, f"GCash Checkout 代理当前为 {main_country or '?'}；目标为 PH，继续由上游校验")
                 self.ensure_not_cancelled(job_id)
             if provider == "paypal":
                 self.update(job_id, percent=9, text="第 1/7 步：校验 PayPal 优惠识别代理与支付代理")
@@ -2679,7 +3571,7 @@ class JobStore:
                     + ("；本轮优惠随 Checkout 创建" if options.get("promo_on_create") else ""),
                 )
             elif provider == "gcash":
-                self.log(job_id, f"GCash 设置：代理池 1 使用 US 创建 PH/PHP Checkout，代理池 2 使用用户选择的 {options.get('promo_country') or '优惠国家'} 更新优惠")
+                self.log(job_id, f"GCash 设置：代理池 1 使用 PH 创建官方 Stripe PH/PHP Checkout，代理池 2 使用用户选择的 {options.get('promo_country') or '优惠国家'} 更新优惠")
             elif provider == "paypal" and promo_requested:
                 self.log(job_id, f"PayPal 设置：代理池 1 用于优惠检查，代理池 2 创建 {country}/{options['currency']} Checkout")
             elif provider == "upi":
@@ -2701,6 +3593,7 @@ class JobStore:
                 lambda m: self.log(job_id, m),
                 use_sen=(True if provider == "gcash" else bool(options.get("use_sen", True))),
                 use_so=(True if provider == "gcash" else bool(options.get("use_so", True))),
+                credential_meta=meta,
             )
             self.ensure_not_cancelled(job_id)
             self.update(job_id, percent=44, text="Checkout 创建完成，正在准备支付方式")
@@ -2717,20 +3610,28 @@ class JobStore:
             promo_chatgpt_http = chatgpt_http
             if provider in {"paypal", "upi", "ideal", "twint", "gcash", "kakao"}:
                 promo_proxy = promo_proxy_for_provider(provider, entry_proxy, exit_proxy)
-                promo_chatgpt_http = sc.build_http(promo_proxy)
+                promo_chatgpt_http = sc.build_http(
+                    promo_proxy,
+                    impersonate=chatgpt_impersonate(meta),
+                )
                 try:
-                    promo_chatgpt_http.cookies.set("oai-did", did, domain="chatgpt.com")
+                    refresh_applied_chatgpt_cookies(promo_chatgpt_http, meta, did)
                     for cookie_name, cookie_value in chatgpt_http.cookies.get_dict().items():
                         promo_chatgpt_http.cookies.set(cookie_name, cookie_value, domain="chatgpt.com")
+                    refresh_applied_chatgpt_cookies(promo_chatgpt_http, meta, did)
                     promo_chatgpt_http.get(
                         "https://chatgpt.com/api/auth/csrf",
-                        headers={"User-Agent": sc.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+                        headers=attach_chatgpt_cookie_header(
+                            promo_chatgpt_http,
+                            {"User-Agent": sc.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+                        ),
                         timeout=20,
                     )
+                    refresh_applied_chatgpt_cookies(promo_chatgpt_http, meta, did)
                 except Exception as exc:
                     self.log(job_id, f"{provider.upper()} 优惠线路暖身提示：{type(exc).__name__}")
                 if provider == "gcash":
-                    self.log(job_id, f"GCash 优惠更新使用代理池 2（{options.get('promo_country') or '用户选择地区'}），Checkout 与确认使用代理池 1（US）")
+                    self.log(job_id, f"GCash 优惠更新使用代理池 2（{options.get('promo_country') or '用户选择地区'}），Checkout 与确认使用代理池 1（PH）")
                 elif provider == "paypal":
                     self.log(job_id, f"PayPal 支付处理使用代理池 2（{country}）")
                 elif provider == "upi":
@@ -2760,7 +3661,7 @@ class JobStore:
                 "checkout_currency": options.get("checkout_currency") or options["currency"],
                 "entry_proxy_pool_size": len(entry_pool),
                 "exit_proxy_pool_size": len(exit_pool) if provider not in {"hosted", "pix", "momo"} else 0,
-                "proxy_mode": ("us_checkout_promo_update" if provider == "gcash" else ("single_chain" if provider in {"pix", "momo"} else ("entry_only" if provider == "hosted" else "dual_chain"))),
+                "proxy_mode": ("ph_checkout_promo_update" if provider == "gcash" else ("single_chain" if provider in {"pix", "momo"} else ("entry_only" if provider == "hosted" else "dual_chain"))),
                 "promo_requested": promo_requested,
                 "promo_applied": None,
                 "promo_campaign_used": options.get("promo_campaign") or "plus-1-month-free",
@@ -2796,11 +3697,13 @@ class JobStore:
                     custom_state = fetch_custom_checkout_session(
                         chatgpt_http, token, session_id, custom_processor, device_id,
                     )
-                    initial_custom_methods = custom_state.get("custom_payment_methods") or []
-                    initial_custom_method_id = next(
-                        (str(item.get("id") or "") for item in initial_custom_methods
-                         if str(item.get("id") or "").startswith("cpmt_")), "",
+                    custom_states: list[Any] = [custom_state]
+                    initial_custom_method_id = select_custom_checkout_method_from_states(
+                        "gcash", custom_state,
                     )
+                    initial_summary = custom_payment_method_summary(custom_state)
+                    if initial_summary:
+                        self.log(job_id, f"GCash 初始支付方式候选：{initial_summary}")
                     # OAICS can publish custom methods a moment after the checkout
                     # object itself becomes readable. Poll briefly before rebuilding.
                     for method_poll in range(1, 4):
@@ -2810,25 +3713,50 @@ class JobStore:
                         custom_state = fetch_custom_checkout_session(
                             chatgpt_http, token, session_id, custom_processor, device_id,
                         )
-                        initial_custom_methods = custom_state.get("custom_payment_methods") or []
-                        initial_custom_method_id = next(
-                            (str(item.get("id") or "") for item in initial_custom_methods
-                             if str(item.get("id") or "").startswith("cpmt_")), "",
+                        custom_states.append(custom_state)
+                        initial_custom_method_id = select_custom_checkout_method_from_states(
+                            "gcash", *list(reversed(custom_states)),
                         )
-                        method_state = "已获取" if initial_custom_method_id else "待同步"
+                        method_summary = custom_payment_method_summary(custom_state)
+                        method_state = (
+                            f"已获取 {initial_custom_method_id}"
+                            if initial_custom_method_id
+                            else f"待同步；候选={method_summary or '-'}"
+                        )
                         self.log(job_id, f"GCash 支付方式同步检查 {method_poll}/3：{method_state}")
                     custom_amount = custom_checkout_amount_minor(custom_state)
                     custom_currency = custom_checkout_currency(custom_state) or "PHP"
+                    custom_update: dict[str, Any] = {}
                     if promo_requested and custom_amount not in {None, 0}:
                         self.update(job_id, percent=66, text="正在应用优惠并刷新 GCash Checkout")
-                        update_checkout_promo(
+                        custom_update = update_checkout_promo(
                             promo_chatgpt_http, token, session_id, custom_processor,
                             options.get("promo_campaign") or "plus-1-month-free",
                             lambda m: self.log(job_id, m), device_id=device_id,
                         )
-                        custom_state = fetch_custom_checkout_session(
-                            chatgpt_http, token, session_id, custom_processor, device_id,
-                        )
+                        if custom_update:
+                            custom_states.append(custom_update)
+                            custom_state = custom_update
+                            update_summary = custom_payment_method_summary(custom_update)
+                            if update_summary:
+                                self.log(job_id, f"GCash 优惠更新支付方式候选：{update_summary}")
+                        for refresh_poll in range(1, 4):
+                            if select_custom_checkout_method_from_states("gcash", custom_state):
+                                break
+                            time.sleep(0.7 * refresh_poll)
+                            refreshed_state = fetch_custom_checkout_session(
+                                chatgpt_http, token, session_id, custom_processor, device_id,
+                            )
+                            custom_states.append(refreshed_state)
+                            custom_state = refreshed_state
+                            refresh_summary = custom_payment_method_summary(refreshed_state)
+                            method_id = select_custom_checkout_method_from_states("gcash", refreshed_state)
+                            method_state = (
+                                f"已获取 {method_id}"
+                                if method_id
+                                else f"待同步；候选={refresh_summary or '-'}"
+                            )
+                            self.log(job_id, f"GCash 优惠后支付方式刷新 {refresh_poll}/3：{method_state}")
                         custom_amount = custom_checkout_amount_minor(custom_state)
                         custom_currency = custom_checkout_currency(custom_state) or custom_currency
                     gcash_billing = default_billing("PH", meta.get("email") or "", real_random=True)
@@ -2850,61 +3778,203 @@ class JobStore:
                         gcash_billing, custom_currency, device_id,
                     )
                     if tax_checkout:
+                        custom_states.append(tax_checkout)
                         custom_state = tax_checkout
                     else:
                         custom_state = fetch_custom_checkout_session(
                             chatgpt_http, token, session_id, custom_processor, device_id,
                         )
+                        custom_states.append(custom_state)
                     custom_amount = custom_checkout_amount_minor(custom_state)
                     custom_currency = custom_checkout_currency(custom_state) or custom_currency
-                    custom_methods = custom_state.get("custom_payment_methods") or []
-                    custom_method_id = next(
-                        (str(item.get("id") or "") for item in custom_methods
-                         if str(item.get("id") or "").startswith("cpmt_")),
-                        initial_custom_method_id,
+                    custom_method_id = select_custom_checkout_method_from_states(
+                        "gcash", custom_state, *list(reversed(custom_states)),
                     )
                     if not custom_method_id:
-                        raise RuntimeError("GCASH_METHOD_UNAVAILABLE: 当前 PH Checkout 尚未返回 GCash 支付方式，将更换代理重建")
+                        method_summary = custom_payment_method_summary({"states": custom_states})
+                        custom_url = (
+                            str(checkout_data.get("checkout_url") or "").strip()
+                            or f"https://chatgpt.com/checkout/{custom_processor}/{session_id}"
+                        )
+                        gcash_direct_url = ""
+                        gcash_direct_error = ""
+                        try:
+                            self.update(job_id, percent=82, text="正在直连 GCash 支付")
+                            started = start_custom_checkout_method(
+                                chatgpt_http,
+                                token,
+                                session_id,
+                                custom_processor,
+                                "external_gcash",
+                                device_id,
+                            )
+                            gcash_direct_url = checkout_redirect_url_from_payload(started)
+                            if gcash_direct_url:
+                                self.log(job_id, "GCash external_gcash 直连启动成功，已获取支付跳转链接")
+                        except Exception as exc:
+                            gcash_direct_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                            self.log(
+                                job_id,
+                                f"GCash external_gcash 直连启动失败，降级为预选 Checkout 页面：{gcash_direct_error}",
+                            )
+                        final_gcash_url = gcash_direct_url or gcash_preselected_checkout_url(custom_url)
+                        self.log(
+                            job_id,
+                            "GCash 后端候选未列出 external_gcash；"
+                            f"候选={method_summary or '-'}。"
+                            + (
+                                "已通过 external_gcash start 获取跳转链接"
+                                if gcash_direct_url
+                                else "官方页面可由 Stripe Elements 动态渲染 GCash，返回预选 Checkout 页面"
+                            ),
+                        )
+                        if not gcash_direct_url and not gcash_page_fallback_allowed(options):
+                            raise RuntimeError(
+                                "GCASH_DIRECT_LINK_UNAVAILABLE: "
+                                "官方 OAICS 后端仅返回 link/card，external_gcash start 被拒绝，"
+                                "未拿到 GCash 直跳链接；"
+                                f"{gcash_direct_error or 'no direct action url'}"
+                            )
+                        amount_verification = checkout_amount_verification(custom_amount)
+                        result.update({
+                            "link_type": "gcash",
+                            "checkout_provider": "open_ai",
+                            "processor_entity": custom_processor,
+                            "custom_payment_method_id": "external_gcash",
+                            "payment_method_type": "external_gcash",
+                            "provider_redirect_url": final_gcash_url,
+                            "short_link": final_gcash_url,
+                            "checkout_url": custom_url,
+                            "source_checkout_url": custom_url,
+                            "verification_url": "",
+                            "checkout_amount": custom_amount,
+                            "amount_currency": custom_currency,
+                            "amount_verification": amount_verification,
+                            "promo_applied": (
+                                (custom_amount == 0)
+                                if promo_requested and custom_amount is not None
+                                else None
+                            ),
+                            "gcash_page_selection_required": not bool(gcash_direct_url),
+                            "gcash_direct_start_attempted": True,
+                            "gcash_direct_start_failed": gcash_direct_error,
+                            "gcash_backend_method_missing": True,
+                            "gcash_backend_method_summary": method_summary,
+                            "expires_at": int(time.time()) + 1800,
+                        })
+                        if promo_requested and custom_amount not in {None, 0}:
+                            self.log(
+                                job_id,
+                                f"GCash Checkout 页面已生成，但优惠未生效：今日应付 amount={custom_amount} {custom_currency}",
+                            )
+                        self.update(
+                            job_id,
+                            percent=100,
+                            text=gcash_done_text(
+                                (
+                                    "GCash 跳转链接生成完成"
+                                    if gcash_direct_url
+                                    else "GCash Checkout 预选页面已生成，请在页面选择 GCash"
+                                ),
+                                promo_requested,
+                                amount_verification,
+                            ),
+                            status="done",
+                            result=result,
+                        )
+                        return
+                    self.log(job_id, f"GCash 支付方式已选中：{custom_method_id}")
+                    confirmation_token_id = ""
+                    external_gcash_method = custom_checkout_method_is_external(custom_method_id)
+                    if not custom_checkout_method_is_custom(custom_method_id) and not external_gcash_method:
+                        publishable_key = (
+                            str(custom_state.get("publishable_key") or "")
+                            or str((custom_state.get("checkout_session") or {}).get("publishable_key") or "")
+                            or str(custom_update.get("publishable_key") or "")
+                            or str((custom_update.get("checkout_session") or {}).get("publishable_key") or "")
+                            or str(checkout_data.get("publishable_key") or "")
+                        )
+                        if not publishable_key:
+                            raise RuntimeError("GCash 原生确认失败：Checkout 未返回 publishable_key")
+                        return_url = custom_checkout_confirm_return_url(
+                            custom_state or custom_update or checkout_data,
+                            session_id,
+                            custom_processor,
+                            options.get("plan") or "plus",
+                        )
+                        self.log(job_id, f"GCash 使用原生 confirmation_token 流程：{custom_method_id}")
+                        confirmation_token_id = create_stripe_confirmation_token(
+                            chatgpt_http,
+                            publishable_key,
+                            custom_method_id,
+                            gcash_billing,
+                            return_url,
+                            lambda m: self.log(job_id, m),
+                        )
                     self.update(job_id, percent=76, text="正在确认 GCash 支付方式")
+                    confirmed = {}
                     try:
                         confirmed = confirm_custom_checkout_method(
                             chatgpt_http, token, session_id, custom_processor,
                             custom_method_id, entry_proxy, device_id, did,
                             use_sen=True, use_so=True, method_name="GCash",
+                            confirmation_token=confirmation_token_id,
+                            billing=gcash_billing,
+                            log=lambda m: self.log(job_id, m),
                         )
                     except RuntimeError as confirm_error:
-                        if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
+                        if external_gcash_method:
+                            self.log(
+                                job_id,
+                                "GCash external_gcash confirm 未直接放行，继续尝试 external start："
+                                f"{str(confirm_error)[:180]}",
+                            )
+                        elif "CUSTOM_CONFIRM_BLOCKED" in str(confirm_error):
+                            self.log(job_id, "GCash confirm 首次被拦截，正在更新 SEN/SO 后重试")
+                            time.sleep(1.2)
+                            confirmed = confirm_custom_checkout_method(
+                                chatgpt_http, token, session_id, custom_processor,
+                                custom_method_id, entry_proxy, device_id, did,
+                                use_sen=True, use_so=True, method_name="GCash",
+                                confirmation_token=confirmation_token_id,
+                                billing=gcash_billing,
+                                log=lambda m: self.log(job_id, m),
+                            )
+                        else:
                             raise
-                        self.log(job_id, "GCash confirm 首次被拦截，正在更新 SEN/SO 后重试")
-                        time.sleep(1.2)
-                        confirmed = confirm_custom_checkout_method(
-                            chatgpt_http, token, session_id, custom_processor,
-                            custom_method_id, entry_proxy, device_id, did,
-                            use_sen=True, use_so=True, method_name="GCash",
-                        )
                     self.update(job_id, percent=88, text="正在生成 GCash 跳转链接")
-                    started = start_custom_checkout_method(
-                        chatgpt_http, token, session_id, custom_processor,
-                        custom_method_id, device_id,
-                    )
-                    action = started.get("next_action") or {}
-                    redirect_url = str(action.get("url") or "").strip()
+                    action: dict[str, Any] = {}
+                    redirect_url = ""
+                    if custom_checkout_method_is_custom(custom_method_id) or external_gcash_method:
+                        started = start_custom_checkout_method(
+                            chatgpt_http, token, session_id, custom_processor,
+                            custom_method_id, device_id,
+                        )
+                        action = started.get("next_action") or {}
+                        redirect_url = checkout_redirect_url_from_payload(started)
+                    else:
+                        redirect_url = checkout_redirect_url_from_payload(confirmed)
+                        if not redirect_url:
+                            try:
+                                refreshed_state = fetch_custom_checkout_session(
+                                    chatgpt_http, token, session_id, custom_processor, device_id,
+                                )
+                                redirect_url = checkout_redirect_url_from_payload(refreshed_state)
+                            except Exception as exc:
+                                self.log(job_id, f"GCash confirm 后刷新提示：{type(exc).__name__}")
                     result.update({
                         "link_type": "gcash",
                         "checkout_provider": "open_ai",
                         "processor_entity": custom_processor,
                         "custom_payment_method_id": custom_method_id,
-                        "payment_method_type": str(action.get("paymentMethodType") or "gcash"),
+                        "payment_method_type": str(action.get("paymentMethodType") or custom_method_id or "gcash"),
                         "provider_redirect_url": redirect_url,
                         "short_link": redirect_url,
                         "checkout_url": redirect_url,
                         "verification_url": str(confirmed.get("confirm_return_url") or ""),
                         "checkout_amount": custom_amount,
                         "amount_currency": custom_currency,
-                        "amount_verification": (
-                            "verified_zero" if custom_amount == 0
-                            else ("pending" if custom_amount is None else "nonzero")
-                        ),
+                        "amount_verification": checkout_amount_verification(custom_amount),
                         "promo_applied": (
                             (custom_amount == 0)
                             if promo_requested and custom_amount is not None else None
@@ -2912,10 +3982,21 @@ class JobStore:
                         "expires_at": int(time.time()) + 1800,
                     })
                     if promo_requested and custom_amount not in {None, 0}:
-                        raise RuntimeError(
-                            f"GCash 优惠未生效：今日应付 amount={custom_amount} {custom_currency}"
+                        self.log(
+                            job_id,
+                            f"GCash 跳转链接已生成，但优惠未生效：今日应付 amount={custom_amount} {custom_currency}",
                         )
-                    self.update(job_id, percent=100, text="GCash 跳转链接生成完成", status="done", result=result)
+                    self.update(
+                        job_id,
+                        percent=100,
+                        text=gcash_done_text(
+                            "GCash 跳转链接生成完成",
+                            promo_requested,
+                            str(result.get("amount_verification") or ""),
+                        ),
+                        status="done",
+                        result=result,
+                    )
                     return
                 if provider == "kakao":
                     self.update(job_id, percent=58, text="正在读取 OAICS Kakao Pay 支付方式")
@@ -2957,6 +4038,8 @@ class JobStore:
                     kakao_geo = payment_geo if str((payment_geo or {}).get("country") or "").upper() == "KR" else None
                     kakao_billing = default_billing("KR", meta.get("email") or "", geo=kakao_geo)
                     kakao_address = kakao_billing.get("address") or {}
+                    if not custom_checkout_billing_is_complete(kakao_billing):
+                        raise RuntimeError("Kakao Pay 账单地址不完整：需要姓名、国家、道/县、城市、地址第 1 行和邮编")
                     self.update(job_id, percent=72, text="正在提交 KR 账单地址")
                     self.log(
                         job_id,
@@ -3006,6 +4089,8 @@ class JobStore:
                                 use_sen=bool(options.get("use_sen", True)),
                                 use_so=bool(options.get("use_so", True)),
                                 method_name="Kakao Pay",
+                                billing=kakao_billing,
+                                log=lambda m: self.log(job_id, m),
                             )
                         except RuntimeError as confirm_error:
                             if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
@@ -3016,6 +4101,8 @@ class JobStore:
                                 chatgpt_http, token, session_id, custom_processor,
                                 custom_method_id, exit_proxy, device_id, did,
                                 use_sen=True, use_so=True, method_name="Kakao Pay",
+                                billing=kakao_billing,
+                                log=lambda m: self.log(job_id, m),
                             )
 
                         self.update(job_id, percent=88, text="正在生成 Kakao Pay 跳转链接")
@@ -3024,7 +4111,7 @@ class JobStore:
                             custom_method_id, device_id, method_name="Kakao Pay",
                         )
                         action = started.get("next_action") or {}
-                        redirect_url = str(action.get("url") or "").strip()
+                        redirect_url = checkout_redirect_url_from_payload(started)
                         payment_method_type = (
                             str(action.get("paymentMethodType") or action.get("payment_method_type") or "")
                             or "kakao_pay"
@@ -3039,7 +4126,13 @@ class JobStore:
                         )
                         if not publishable_key:
                             raise RuntimeError("Kakao Pay 原生确认失败：Checkout 未返回 publishable_key")
-                        return_url = f"https://chatgpt.com/checkout/{custom_processor}/{session_id}"
+                        return_url = custom_checkout_confirm_return_url(
+                            custom_state or custom_update or checkout_data,
+                            session_id,
+                            custom_processor,
+                            options.get("plan") or "plus",
+                        )
+                        self.log(job_id, "Kakao Pay confirmation_token return_url 使用 checkout verify 路由")
                         self.log(job_id, f"Kakao Pay 使用原生 confirmation_token 流程：{custom_method_id}")
                         confirmation_token_id = create_stripe_confirmation_token(
                             chatgpt_http,
@@ -3057,6 +4150,8 @@ class JobStore:
                                 use_so=bool(options.get("use_so", True)),
                                 method_name="Kakao Pay",
                                 confirmation_token=confirmation_token_id,
+                                billing=kakao_billing,
+                                log=lambda m: self.log(job_id, m),
                             )
                         except RuntimeError as confirm_error:
                             if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
@@ -3068,6 +4163,8 @@ class JobStore:
                                 custom_method_id, exit_proxy, device_id, did,
                                 use_sen=True, use_so=True, method_name="Kakao Pay",
                                 confirmation_token=confirmation_token_id,
+                                billing=kakao_billing,
+                                log=lambda m: self.log(job_id, m),
                             )
                         redirect_url = checkout_redirect_url_from_payload(confirmed)
                         if not redirect_url:
@@ -3162,6 +4259,7 @@ class JobStore:
                                 use_sen=bool(options.get("use_sen", True)),
                                 use_so=bool(options.get("use_so", True)),
                                 method_name="PayPal",
+                                log=lambda m: self.log(job_id, m),
                             )
                         except RuntimeError as confirm_error:
                             if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
@@ -3171,13 +4269,14 @@ class JobStore:
                                 chatgpt_http, token, session_id, custom_processor,
                                 method_id, exit_proxy, device_id, did,
                                 use_sen=True, use_so=True, method_name="PayPal",
+                                log=lambda m: self.log(job_id, m),
                             )
                         started = start_custom_checkout_method(
                             chatgpt_http, token, session_id, custom_processor,
                             method_id, device_id,
                         )
                         action = started.get("next_action") or {}
-                        candidate_url = str(action.get("url") or "").strip()
+                        candidate_url = checkout_redirect_url_from_payload(started)
                         candidate_type = str(action.get("paymentMethodType") or "").lower()
                         if "paypal" in candidate_type or "paypal" in candidate_url.lower():
                             selected_method_id = method_id
@@ -3473,7 +4572,8 @@ class JobStore:
                     elif str(identity.get("source") or "").startswith("generated_"):
                         generated_kind = str(identity.get("source")).removeprefix("generated_").upper()
                         self.log(job_id, f"PIX 本轮已自动生成 {generated_kind}、持有人/企业名称及巴西地址")
-            stripe_http = sc.build_http(exit_proxy)
+            stripe_payment_proxy = entry_proxy if provider == "gcash" else exit_proxy
+            stripe_http = sc.build_http(stripe_payment_proxy)
 
             progress_mark = 62
 
@@ -3514,6 +4614,7 @@ class JobStore:
                     device_id,
                     did,
                     http=provider_chatgpt_http,
+                    credential_meta=meta,
                     log=provider_log,
                 )
                 self.ensure_not_cancelled(job_id)

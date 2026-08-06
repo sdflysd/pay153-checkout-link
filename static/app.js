@@ -102,10 +102,10 @@ function syncFields(applyRailDefault=false){
     upi: '推荐代理：代理池 1 使用可获得优惠资格的国家或地区（如 TR、JP、BR），代理池 2 使用 IN 创建并处理 UPI。',
     pix: '推荐代理：代理池 1 使用 BR。',
     momo: '推荐代理：代理池 1 全程使用 VN，Checkout、优惠、Stripe 与确认均保持同一条越南线路。',
-    gcash: '推荐代理：代理池 1 使用 US 创建 PH/PHP 账单，代理池 2 使用你选择的优惠国家。',
+    gcash: '推荐代理：代理池 1 使用 PH 创建 PH/PHP 账单，代理池 2 使用你选择的优惠国家。',
     kakao: '推荐代理：代理池 1 使用 VN 应用优惠，代理池 2 使用 KR 创建并处理 Kakao Pay。'
   };
-  const pool2Hints = {ph_short:'必须 TR',paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN',kakao:'推荐 KR'};
+  const pool2Hints = {ph_short:'必须 TR',paypal:'巴西 PayPal 推荐 BR',ideal:'推荐 NL',upi:'推荐 IN',gcash:'默认 VN',kakao:'推荐 KR'};
   const recommendation = recommendations[rail] || '推荐代理：使用与所选地区一致的代理。';
   $('proxyRecommendation').textContent = recommendation;
   $('proxyFootHint').textContent = recommendation;

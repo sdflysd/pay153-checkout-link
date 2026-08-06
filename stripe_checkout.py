@@ -226,11 +226,11 @@ def _paypal_setup_diagnostic(payload: dict) -> dict:
     return summary
 
 
-def build_http(proxy: Optional[str]):
+def build_http(proxy: Optional[str], *, impersonate: str = "firefox144"):
     """curl_cffi Session（Firefox 144 TLS 指纹），跟随支付代理。"""
     from curl_cffi.requests import Session as CffiSession
 
-    http = CffiSession(impersonate="firefox144")
+    http = CffiSession(impersonate=impersonate or "firefox144")
     try:
         http.trust_env = False
     except Exception:
@@ -642,6 +642,12 @@ def snapshot_billing(chatgpt_http, access_token: str, session_id: str, processor
         "OAI-Language": "en-US",
     }
     try:
+        cookie_header = str(getattr(chatgpt_http, "headers", {}).get("Cookie") or "").strip()
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+    except Exception:
+        pass
+    try:
         resp = chatgpt_http.post(
             "https://chatgpt.com/backend-api/payments/checkout/snapshot",
             json=payload, headers=headers, timeout=20,
@@ -983,6 +989,12 @@ def approve_submission(chatgpt_http, access_token: str, session_id: str, process
         "User-Agent": CHROME_UA,
         "OAI-Language": "en-US",
     }
+    try:
+        cookie_header = str(getattr(chatgpt_http, "headers", {}).get("Cookie") or "").strip()
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+    except Exception:
+        pass
     body = {"checkout_session_id": session_id, "processor_entity": processor_entity}
     ar = chatgpt_http.post(
         "https://chatgpt.com/backend-api/payments/checkout/approve",

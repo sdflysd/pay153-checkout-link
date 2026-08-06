@@ -26,6 +26,7 @@ PROVIDER_DEFAULTS = {
     "kakao": {"country": "KR", "currency": "KRW"},
 }
 STRIPE_PAYMENT_METHOD_ALIASES = {
+    "gcash": "external_gcash",
     "kakao": "kakao_pay",
 }
 
@@ -1156,9 +1157,14 @@ def stripe_to_provider(
     pk = str(stage1.get("publishable_key") or "") or sc.verify_pk(http, session_id, log)
     init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
     methods = ctx.get("payment_method_types") or []
-    if stripe_provider not in methods:
+    accepted_methods = [stripe_provider]
+    if provider == "gcash":
+        accepted_methods.append("gcash")
+    available_method = next((method for method in accepted_methods if method in methods), "")
+    if not available_method:
         label = f"{provider}/{stripe_provider}" if stripe_provider != provider else provider
         raise RuntimeError(f"当前 checkout 未开放 {label}，可用方式：{', '.join(methods) or 'card'}")
+    stripe_provider = available_method
     sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
     processor = str(stage1.get("processor_entity") or "") or sc._entity_from_return_url(ctx.get("return_url") or init_data.get("return_url") or "") or "openai_llc"
     if apply_promo_callback and not late_promo:
@@ -1176,10 +1182,49 @@ def stripe_to_provider(
             init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
             ctx["original_checkout_amount"] = original_checkout_amount
             methods = ctx.get("payment_method_types") or []
-            if stripe_provider not in methods:
+            available_method = next((method for method in accepted_methods if method in methods), "")
+            if not available_method:
                 label = f"{provider}/{stripe_provider}" if stripe_provider != provider else provider
                 raise RuntimeError(f"应用优惠后 checkout 未开放 {label}，可用方式：{', '.join(methods) or 'card'}")
+            stripe_provider = available_method
             sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+    if provider == "gcash" and stripe_provider == "external_gcash":
+        ctx["billing"] = billing
+        sc.update_tax_region(http, session_id, pk, version, ctx, billing, profile, log)
+        checkout_amount = ctx.get("checkout_amount")
+        promo_applied = None
+        if require_zero_due:
+            if checkout_amount is None:
+                raise RuntimeError("优惠金额校验失败：Stripe 未返回今日应付金额")
+            try:
+                promo_applied = int(str(checkout_amount)) == 0
+            except ValueError:
+                promo_applied = str(checkout_amount).strip() in {"0", "0.0", "0.00"}
+            if not promo_applied:
+                log(f"[gcash] external_gcash 页面已生成，但优惠未生效：Stripe 今日应付 amount={checkout_amount}")
+            else:
+                log("[gcash] external_gcash 优惠金额校验通过：Stripe 今日应付 amount=0")
+        hosted_url = (
+            str(ctx.get("stripe_hosted_url") or "")
+            or str(init_data.get("stripe_hosted_url") or "")
+            or str(stage1.get("checkout_url") or "")
+        )
+        external_url = _hosted_provider_return_url(hosted_url, "external_gcash")
+        log("[gcash] 检测到 Stripe external_gcash，返回官方外部支付 Checkout 链")
+        return {
+            "provider": provider,
+            "provider_redirect_url": external_url,
+            "stripe_redirect_url": external_url,
+            "payment_method_type": "external_gcash",
+            "payment_method_types": ctx.get("payment_method_types") or methods,
+            "processor_entity": processor,
+            "stripe_publishable_key": pk,
+            "checkout_amount": checkout_amount,
+            "checkout_currency": str(ctx.get("currency") or "").upper(),
+            "promo_requested": require_zero_due,
+            "promo_applied": promo_applied if require_zero_due else None,
+            "external_payment_method": True,
+        }
     if provider == "pix" and require_zero_due and not late_promo:
         original_checkout_amount = ctx.get("original_checkout_amount")
         init_data, version, ctx = _hosted_checkout_init(

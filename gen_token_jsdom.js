@@ -6,6 +6,13 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
+const input = JSON.parse(fs.readFileSync(process.argv[2], "utf-8"));
+const browserUserAgent = input.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+const browserLanguage = input.language || "en-US";
+const browserLanguageBase = browserLanguage.includes("-") ? browserLanguage.split("-")[0] : "en";
+const browserLanguages = browserLanguageBase && browserLanguageBase !== browserLanguage
+  ? [browserLanguage, browserLanguageBase, "en"]
+  : [browserLanguage, "en"];
 
 // 读取与部署包放在一起的 Sentinel SDK，避免依赖开发机私有目录。
 const sdkPath = process.env.SENTINEL_SDK_PATH || path.join(__dirname, "sentinel_sdk_full.js");
@@ -43,6 +50,11 @@ const dom = new JSDOM(`<!DOCTYPE html><html><body></body></html>`, {
 });
 
 const { window } = dom;
+Object.defineProperty(window.navigator, "userAgent", { get: () => browserUserAgent });
+Object.defineProperty(window.navigator, "language", { get: () => browserLanguage });
+Object.defineProperty(window.navigator, "languages", { get: () => browserLanguages });
+Object.defineProperty(window.navigator, "platform", { get: () => "Win32" });
+Object.defineProperty(window.navigator, "vendor", { get: () => "Google Inc." });
 const scriptEl = window.document.createElement("script");
 scriptEl.src = "https://chatgpt.com/sentinel/20260219f9f6/sdk.js";
 window.document.head.appendChild(scriptEl);
@@ -87,7 +99,6 @@ if (typeof window.SentinelSDK?.___n === "function") {
   const _n = window.SentinelSDK.___n;
   const Nt = window.SentinelSDK.__Nt;
   const D = window.SentinelSDK.__D;
-  const input = JSON.parse(fs.readFileSync(process.argv[2], "utf-8"));
   const { chatReq, flow, deviceId, cachedProof } = input;
 
   const turnstileDx = chatReq.turnstile?.dx || null;

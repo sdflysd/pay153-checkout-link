@@ -49,6 +49,9 @@
 | iDEAL | 荷兰银行支付路径 |
 | UPI | 印度 UPI 支付与二维码 |
 | PIX | 巴西 PIX 支付与二维码 |
+| GCash | 菲律宾 GCash 电子钱包，PH/PHP Checkout |
+
+GCash PH 优惠探测流程见：[docs/gcash-promo-probe-ph.md](docs/gcash-promo-probe-ph.md)。
 
 ## 项目结构
 

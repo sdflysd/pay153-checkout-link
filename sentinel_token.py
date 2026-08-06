@@ -73,7 +73,11 @@ def random_from_list(lst):
     return lst[random.randint(0, len(lst) - 1)] if lst else ""
 
 
-def gather_fingerprint_data(sid: str) -> list:
+def gather_fingerprint_data(
+    sid: str,
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+) -> list:
     """
     收集浏览器指纹数据 (25项), 与 SDK initializeAndGatherData() 一致。
     索引 [3] 和 [9] 会被 PoW 覆写。
@@ -83,18 +87,22 @@ def gather_fingerprint_data(sid: str) -> list:
     time_origin = round(time.time() * 1000 - 50000, 1)
 
     nav_prop = random_from_list(NAVIGATOR_KEYS)
-    nav_val = _fake_navigator_value(nav_prop)
+    user_agent = str(user_agent or FAKE_USER_AGENT)
+    language = str(language or "en-US")
+    language_base = language.split("-", 1)[0] if "-" in language else language
+    languages = f"{language},{language_base}" if language_base and language_base != language else f"{language},en"
+    nav_val = _fake_navigator_value(nav_prop, user_agent, language, languages)
 
     return [
         1920 + 1080,                          # [0] screen.width + screen.height
         now_str,                                # [1] "" + new Date()
         4294705152,                             # [2] performance.memory.jsHeapSizeLimit
         0,                                      # [3] Math.random() → 覆写为 nonce
-        FAKE_USER_AGENT,                        # [4] navigator.userAgent
+        user_agent,                             # [4] navigator.userAgent
         random_from_list(SCRIPT_SRCS),          # [5] random script src
         None,                                   # [6] data-build (null if not found)
-        "en-US",                                # [7] navigator.language
-        "en-US,en",                             # [8] navigator.languages.join(",")
+        language,                               # [7] navigator.language
+        languages,                              # [8] navigator.languages.join(",")
         0,                                      # [9] Math.random() → 覆写为 elapsed time
         f"{nav_prop}\u2212{nav_val}",           # [10] random navigator prop + "−" + value
         random_from_list(DOCUMENT_KEYS),        # [11] random document key
@@ -114,19 +122,24 @@ def gather_fingerprint_data(sid: str) -> list:
     ]
 
 
-def _fake_navigator_value(prop: str) -> str:
+def _fake_navigator_value(
+    prop: str,
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+    languages: str = "en-US,en",
+) -> str:
     """伪造 navigator 属性值"""
     values = {
-        "userAgent": FAKE_USER_AGENT,
-        "language": "en-US",
-        "languages": "en-US,en",
+        "userAgent": user_agent,
+        "language": language,
+        "languages": languages,
         "platform": "Win32",
         "vendor": "Google Inc.",
         "vendorSub": "",
         "product": "Gecko",
         "productSub": "20030107",
         "appName": "Netscape",
-        "appVersion": "5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
+        "appVersion": user_agent.replace("Mozilla/", ""),
         "hardwareConcurrency": "8",
         "deviceMemory": "8",
         "maxTouchPoints": "0",
@@ -170,18 +183,27 @@ def solve_pow(seed: str, difficulty: str, data: list, max_attempts: int = 500000
     return "gAAAAAB" + encode_data("e")
 
 
-def generate_requirements_token(sid: str) -> str:
+def generate_requirements_token(
+    sid: str,
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+) -> str:
     """
     生成 requirements token (内部 seed, difficulty "0")
     返回: "gAAAAAC" + PoW answer
     """
     seed = str(random.random())  # this.requirementsSeed
-    data = gather_fingerprint_data(sid)
+    data = gather_fingerprint_data(sid, user_agent, language)
     answer = solve_pow(seed, "0", data)
     return "gAAAAAC" + answer
 
 
-def generate_enforcement_token(chat_req: dict, sid: str) -> str:
+def generate_enforcement_token(
+    chat_req: dict,
+    sid: str,
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+) -> str:
     """
     生成 enforcement token (server seed + difficulty)
     返回: "gAAAAAB" + PoW answer
@@ -193,7 +215,7 @@ def generate_enforcement_token(chat_req: dict, sid: str) -> str:
     if not seed or not difficulty:
         return "gAAAAAB" + encode_data("e")
 
-    data = gather_fingerprint_data(sid)
+    data = gather_fingerprint_data(sid, user_agent, language)
     answer = solve_pow(seed, difficulty, data)
     return "gAAAAAB" + answer
 
@@ -573,21 +595,41 @@ def run_turnstile_vm(chat_req: dict, dx: str) -> Optional[str]:
     return None
 
 
-def run_turnstile_vm_with_key(chat_req: dict, dx: str, xor_key: str, flow: str = "oauth_create_account") -> Optional[str]:
+def run_turnstile_vm_with_key(
+    chat_req: dict,
+    dx: str,
+    xor_key: str,
+    flow: str = "oauth_create_account",
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+) -> Optional[str]:
     """运行 turnstile VM (通过 Node.js + jsdom 执行 SDK)"""
-    return _run_vm_via_node(chat_req, xor_key, "turnstile", flow)
+    return _run_vm_via_node(chat_req, xor_key, "turnstile", flow, user_agent, language)
 
 
-def _run_vm_via_node(chat_req: dict, xor_key: str, vm_type: str, flow: str = "oauth_create_account") -> Optional[str]:
+def _run_vm_via_node(
+    chat_req: dict,
+    xor_key: str,
+    vm_type: str,
+    flow: str = "oauth_create_account",
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+) -> Optional[str]:
     """通过 Node.js 运行 sentinel SDK VM, 返回 t 或 so"""
-    data = _run_vm_bundle_via_node(chat_req, xor_key, flow)
+    data = _run_vm_bundle_via_node(chat_req, xor_key, flow, user_agent, language)
     if not data:
         return None
     value = data.get("so" if vm_type == "so" else "t")
     return value if value else None
 
 
-def _run_vm_bundle_via_node(chat_req: dict, xor_key: str, flow: str = "oauth_create_account") -> Optional[dict]:
+def _run_vm_bundle_via_node(
+    chat_req: dict,
+    xor_key: str,
+    flow: str = "oauth_create_account",
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+) -> Optional[dict]:
     """一次 Node.js VM 执行同时生成当前 challenge 对应的 t / so。"""
     import subprocess, os, tempfile
 
@@ -604,6 +646,8 @@ def _run_vm_bundle_via_node(chat_req: dict, xor_key: str, flow: str = "oauth_cre
         "flow": flow,
         "deviceId": str(uuid.uuid4()),
         "cachedProof": xor_key,
+        "userAgent": str(user_agent or FAKE_USER_AGENT),
+        "language": str(language or "en-US"),
     }
 
     # 写唯一临时文件 (避免并发冲突)
@@ -655,10 +699,17 @@ def run_session_observer_vm(collector_dx: str) -> Optional[str]:
     return None
 
 
-def run_session_observer_vm_with_key(collector_dx: str, xor_key: str, chat_req: dict = None, flow: str = "oauth_create_account") -> Optional[str]:
+def run_session_observer_vm_with_key(
+    collector_dx: str,
+    xor_key: str,
+    chat_req: dict = None,
+    flow: str = "oauth_create_account",
+    user_agent: str = FAKE_USER_AGENT,
+    language: str = "en-US",
+) -> Optional[str]:
     """运行 session observer VM (通过 Node.js)"""
     if chat_req:
-        return _run_vm_via_node(chat_req, xor_key, "so", flow)
+        return _run_vm_via_node(chat_req, xor_key, "so", flow, user_agent, language)
     return None
 
 
@@ -679,11 +730,19 @@ class SentinelTokenProvider:
     BACKEND_URL = "https://sentinel.openai.com/backend-api/sentinel/"
     FRAME_REFERER = "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
 
-    def __init__(self, impersonate: str = "firefox144", cookies: dict = None):
+    def __init__(
+        self,
+        impersonate: str = "firefox144",
+        cookies: dict = None,
+        user_agent: str = FAKE_USER_AGENT,
+        language: str = "en-US",
+    ):
         self.impersonate = impersonate
         self._session: Optional[requests.AsyncSession] = None
         self.sid = str(uuid.uuid4())
         self._cookies = cookies or {}
+        self.user_agent = str(user_agent or FAKE_USER_AGENT)
+        self.language = str(language or "en-US")
         # 缓存
         self._cached_proof: Optional[str] = None
         self._cached_chat_req: Optional[dict] = None
@@ -707,6 +766,8 @@ class SentinelTokenProvider:
                 resp = await s.post(url, data=body, headers={
                     "content-type": "text/plain;charset=UTF-8",
                     "referer": self.FRAME_REFERER,
+                    "user-agent": self.user_agent,
+                    "accept-language": f"{self.language},{self.language.split('-', 1)[0]};q=0.9,en;q=0.8",
                 }, cookies=self._cookies)
                 return resp.json()
             except Exception as e:
@@ -717,7 +778,9 @@ class SentinelTokenProvider:
     async def _init(self, flow: str, device_id: str) -> None:
         """初始化: 生成 requirements token → POST → 获取 chatReq"""
         self._device_id = device_id
-        proof = await asyncio.to_thread(generate_requirements_token, self.sid)
+        proof = await asyncio.to_thread(
+            generate_requirements_token, self.sid, self.user_agent, self.language
+        )
         self._cached_proof = proof
         chat_req = await self._post_proof(proof, flow)
         self._last_init_error = str(chat_req.get("error") or "") if isinstance(chat_req, dict) else "SENTINEL_INIT_INVALID_PAYLOAD"
@@ -763,8 +826,21 @@ class SentinelTokenProvider:
             diagnostics["turnstile_required"] = bool(turnstile.get("required") or turnstile.get("dx"))
             diagnostics["so_required"] = bool(so_info.get("required"))
 
-            p_future = asyncio.to_thread(generate_enforcement_token, chat_req, self.sid)
-            vm_future = asyncio.to_thread(_run_vm_bundle_via_node, chat_req, proof, flow)
+            p_future = asyncio.to_thread(
+                generate_enforcement_token,
+                chat_req,
+                self.sid,
+                self.user_agent,
+                self.language,
+            )
+            vm_future = asyncio.to_thread(
+                _run_vm_bundle_via_node,
+                chat_req,
+                proof,
+                flow,
+                self.user_agent,
+                self.language,
+            )
             p_token, vm_data = await asyncio.gather(p_future, vm_future)
             vm_data = vm_data or {}
             t_token = vm_data.get("t")
@@ -813,13 +889,23 @@ class SentinelTokenProvider:
             return None
 
         # 生成 enforcement token (CPU 密集, 放线程池避免阻塞事件循环)
-        p_token = await asyncio.to_thread(generate_enforcement_token, chat_req, self.sid)
+        p_token = await asyncio.to_thread(
+            generate_enforcement_token, chat_req, self.sid, self.user_agent, self.language
+        )
 
         # 生成 turnstile proof (如果有)
         t_token = None
         turnstile = chat_req.get("turnstile", {})
         if turnstile.get("dx"):
-            t_token = await asyncio.to_thread(run_turnstile_vm_with_key, chat_req, turnstile["dx"], self._cached_proof, flow)
+            t_token = await asyncio.to_thread(
+                run_turnstile_vm_with_key,
+                chat_req,
+                turnstile["dx"],
+                self._cached_proof,
+                flow,
+                self.user_agent,
+                self.language,
+            )
 
         # c 字段 = server challenge token
         c_token = chat_req.get("token", "")
