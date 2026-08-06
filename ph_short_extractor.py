@@ -35,7 +35,6 @@ Use ``--credential-file -`` to read a token or session JSON from stdin.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import getpass
 import json
 import os
@@ -50,6 +49,11 @@ from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
 
 try:
     from curl_cffi.requests import Session as CurlSession
@@ -255,16 +259,18 @@ def persist_private_checkout_context(
     target = Path(os.getenv("PH_SHORT_CONTEXT_PATH", "/opt/pay153/data/ph_short_contexts.jsonl"))
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8", newline="\n") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
         handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
         handle.flush()
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
 
 
 def parse_credentials(raw: str, explicit_session_cookie: str = "") -> Credentials:

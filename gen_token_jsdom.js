@@ -35,14 +35,17 @@ if (hookedCode === sdkCode) {
 
 // 创建 jsdom
 const dom = new JSDOM(`<!DOCTYPE html><html><body></body></html>`, {
-  url: "https://auth.openai.com/about-you",
-  referrer: "https://auth.openai.com/about-you",
+  url: "https://chatgpt.com/checkout/open_ai/oaics_placeholder",
+  referrer: "https://chatgpt.com/",
   contentType: "text/html",
   runScripts: "outside-only",
   pretendToBeVisual: true,
 });
 
 const { window } = dom;
+const scriptEl = window.document.createElement("script");
+scriptEl.src = "https://chatgpt.com/sentinel/20260219f9f6/sdk.js";
+window.document.head.appendChild(scriptEl);
 
 // 补充 crypto
 if (!window.crypto) window.crypto = {};

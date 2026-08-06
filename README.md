@@ -86,6 +86,17 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
+### Windows 一键启动/停止
+
+在 Windows 桌面环境可直接双击根目录脚本：
+
+```text
+start_pay153.bat  # 启动服务并打开 http://127.0.0.1:18082
+stop_pay153.bat   # 停止服务
+```
+
+脚本会复用或创建 `.venv`，缺少依赖时自动安装 `requirements.txt`，并将进程号写入 `logs/pay153.pid`。运行日志位于 `logs/flask.out.log` 和 `logs/flask.err.log`。
+
 生产环境推荐使用 Gunicorn：
 
 ```bash

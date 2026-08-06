@@ -48,6 +48,9 @@ app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/stat
 app.config["JSON_AS_ASCII"] = False
 
 ROTATING_PAYPAL_ADDRESS_COUNTRIES = {"NL", "GB", "TH", "BR", "US"}
+EXIT_PROXY_CHECKOUT_PROVIDERS = {"paypal", "upi", "ideal", "twint", "kakao"}
+ENTRY_PROXY_PROMO_PROVIDERS = {"paypal", "upi", "ideal", "twint", "kakao"}
+SENTINEL_DEFAULT_TELEMETRY = "[1,null]"
 DYNAMIC_PROXY_API_URL = str(
     os.getenv("PAY153_DYNAMIC_PROXY_API")
     or "https://white.1024proxy.com/white/api"
@@ -139,6 +142,37 @@ def normalize_rotating_paypal_address(country: str, value: dict[str, Any]) -> di
         "postal_code": postal,
         "state": state,
     }
+
+
+def checkout_proxy_for_provider(provider: str, entry_proxy: str, exit_proxy: str) -> str:
+    provider = str(provider or "").lower()
+    return exit_proxy if provider in EXIT_PROXY_CHECKOUT_PROVIDERS else entry_proxy
+
+
+def promo_proxy_for_provider(provider: str, entry_proxy: str, exit_proxy: str) -> str:
+    provider = str(provider or "").lower()
+    return entry_proxy if provider in ENTRY_PROXY_PROMO_PROVIDERS else exit_proxy
+
+
+def default_entry_proxy_country(link_type: str, country: str) -> str:
+    link_type = str(link_type or "").lower()
+    country = str(country or "US").upper()
+    if link_type == "kakao":
+        return "VN"
+    if link_type in {"gcash", "ph_short"} and country == "PH":
+        return "US"
+    return country
+
+
+def default_exit_proxy_country(link_type: str, country: str, promo_country: str, use_promo: bool) -> str:
+    link_type = str(link_type or "").lower()
+    country = str(country or "US").upper()
+    promo_country = str(promo_country or "").strip().upper()[:2]
+    if link_type == "gcash":
+        return promo_country or "VN"
+    if link_type == "ph_short" and use_promo:
+        return promo_country or ("TR" if country == "PH" else country)
+    return country
 
 
 def remember_rust_job_alias(public_job_id: str, rust_job_id: str, metadata: dict[str, Any]) -> None:
@@ -324,6 +358,12 @@ class ProxySentinel(BaseSentinel):
     def __init__(self, proxy: str | None, cookies: dict[str, str]):
         super().__init__(impersonate="firefox144", cookies=cookies)
         self.proxy = proxy
+        sentinel_backend = str(
+            os.getenv("PAY153_SENTINEL_BACKEND_URL")
+            or "https://chatgpt.com/backend-api/sentinel/"
+        ).rstrip("/") + "/"
+        self.BACKEND_URL = sentinel_backend
+        self.FRAME_REFERER = sentinel_backend + "frame.html?sv=20260219f9f6"
 
     async def _get_session(self):
         if not self._session:
@@ -613,6 +653,8 @@ async def sentinel_headers(
                     out["OpenAI-Sentinel-Token"] = json.dumps(token, separators=(",", ":"))
                 if use_so and so:
                     out["OpenAI-Sentinel-SO-Token"] = json.dumps(so, separators=(",", ":"))
+                if out:
+                    out["OAI-Telemetry"] = SENTINEL_DEFAULT_TELEMETRY
                 return out
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -662,7 +704,7 @@ def checkout_payload(options: dict, meta: dict) -> dict[str, Any]:
             "auto_top_up_enabled": True,
         }
     elif plan == "plus" and options.get("use_promo") and (
-        options.get("link_type") not in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"}
+        options.get("link_type") not in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint", "kakao"}
         or options.get("promo_on_create")
     ):
         common["promo_campaign"] = {
@@ -781,9 +823,10 @@ def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_
                     "promotion_processor": str(offer.get("processor") or ""),
                     "promotion_transport": str(offer.get("transport") or ""),
                 }
+                fallback_campaign_id = campaign_id or "\u5f53\u524d\u65e0\u4f18\u60e0"
                 log(
                     f"Rust \u4f18\u60e0\u68c0\u6d4b\u5b8c\u6210\uff1a"
-                    f"{campaign_id or '\u5f53\u524d\u65e0\u4f18\u60e0'}\uff08{normalized['promotion_transport']}\uff09"
+                    f"{fallback_campaign_id}\uff08{normalized['promotion_transport']}\uff09"
                 )
                 return normalized
             log(f"Rust \u4f18\u60e0\u68c0\u6d4b HTTP {rust_response.status_code}\uff0c\u56de\u9000 Python")
@@ -844,7 +887,8 @@ def preflight_trial_eligibility(token: str, account_id: str, proxy: str, device_
             "eligible_offers": account.get("eligible_offers") or {},
         }
         if campaign_id:
-            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u5df2\u5339\u914d\uff1a{campaign_id}\uff08{label or 'Plus \u6d3b\u52a8'}\uff09")
+            campaign_label = label or "Plus \u6d3b\u52a8"
+            log(f"\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u5df2\u5339\u914d\uff1a{campaign_id}\uff08{campaign_label}\uff09")
         else:
             log("\u8d26\u53f7\u6d3b\u52a8\u76ee\u5f55\u672a\u8fd4\u56de Plus \u4f18\u60e0")
         return normalized
@@ -1140,6 +1184,254 @@ def submit_custom_checkout_taxes(
     return checkout if isinstance(checkout, dict) else {}
 
 
+def custom_payment_method_text(method: Any) -> str:
+    if isinstance(method, str):
+        return _ascii_key(method)
+    if not isinstance(method, dict):
+        return ""
+    parts: list[str] = []
+    for key in (
+        "id", "type", "name", "display_name", "label", "payment_method_type",
+        "paymentMethodType", "provider", "processor", "subtitle", "description",
+        "title", "value", "code", "custom_payment_method_type_id",
+        "customPaymentMethodTypeId",
+    ):
+        value = method.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    try:
+        parts.append(json.dumps(method, ensure_ascii=False))
+    except Exception:
+        pass
+    return _ascii_key(" ".join(parts))
+
+
+def custom_payment_method_identifier(method: Any) -> str:
+    if isinstance(method, str):
+        return method.strip()
+    if not isinstance(method, dict):
+        return ""
+    for key in (
+        "id", "custom_payment_method_type_id", "customPaymentMethodTypeId",
+        "payment_method_type", "paymentMethodType", "type", "value", "code",
+    ):
+        value = method.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def custom_checkout_method_is_custom(method_id: str) -> bool:
+    return str(method_id or "").startswith("cpmt_")
+
+
+def extract_custom_checkout_methods(data: Any) -> list[Any]:
+    method_keys = {
+        "custom_payment_methods",
+        "customPaymentMethods",
+        "custom_payment_method_types",
+        "customPaymentMethodTypes",
+        "payment_method_types",
+        "paymentMethodTypes",
+        "payment_methods",
+        "paymentMethods",
+        "available_payment_methods",
+        "availablePaymentMethods",
+        "available_payment_method_types",
+        "availablePaymentMethodTypes",
+    }
+    methods: list[Any] = []
+    seen: set[str] = set()
+
+    def add_method(item: Any) -> None:
+        identifier = custom_payment_method_identifier(item)
+        text = custom_payment_method_text(item)
+        if not identifier and not text:
+            return
+        key = f"{identifier}\n{text}"
+        if key in seen:
+            return
+        seen.add(key)
+        methods.append(item)
+
+    def walk(value: Any, parent_key: str = "") -> None:
+        if isinstance(value, dict):
+            if parent_key in method_keys:
+                add_method(value)
+            for key, item in value.items():
+                key_text = str(key)
+                if key_text in method_keys:
+                    if isinstance(item, list):
+                        for child in item:
+                            add_method(child)
+                    elif isinstance(item, dict):
+                        for child in item.values():
+                            if isinstance(child, list):
+                                for grandchild in child:
+                                    add_method(grandchild)
+                            else:
+                                add_method(child)
+                    elif isinstance(item, str):
+                        add_method(item)
+                walk(item, key_text)
+        elif isinstance(value, list):
+            if parent_key in method_keys:
+                for item in value:
+                    add_method(item)
+            for item in value:
+                walk(item, parent_key)
+
+    walk(data)
+    return methods
+
+
+def custom_payment_method_summary(methods: Any, limit: int = 8) -> str:
+    normalized = extract_custom_checkout_methods(methods) if not isinstance(methods, list) else methods
+    labels: list[str] = []
+    for method in normalized[:max(1, limit)]:
+        identifier = custom_payment_method_identifier(method) or "-"
+        text = custom_payment_method_text(method)
+        label = identifier
+        for needle in ("kakao", "kakao_pay", "kakaopay", "카카오", "naver", "card", "paypal", "gcash"):
+            if needle in text and needle not in _ascii_key(label):
+                label = f"{label}:{needle}"
+                break
+        labels.append(label[:80])
+    extra = "" if len(normalized) <= limit else f"+{len(normalized) - limit}"
+    return ",".join(labels) + extra
+
+
+def select_custom_checkout_method(methods: Any, provider: str) -> str:
+    provider = str(provider or "").strip().lower()
+    if not isinstance(methods, list):
+        methods = extract_custom_checkout_methods(methods)
+    candidates = [
+        item for item in (methods or [])
+        if custom_payment_method_identifier(item)
+    ]
+    if not candidates:
+        return ""
+
+    if provider == "kakao":
+        ranked: list[tuple[int, str]] = []
+        for item in candidates:
+            method_id = custom_payment_method_identifier(item)
+            text = custom_payment_method_text(item)
+            if any(alias in text for alias in ("kakao", "kakaopay", "kakao_pay", "카카오", "카카오페이")):
+                ranked.append((0, method_id))
+            elif method_id.startswith("cpmt_") and len(candidates) == 1 and "naver" not in text and "card" not in text:
+                ranked.append((5, method_id))
+        ranked.sort(key=lambda pair: pair[0])
+        return ranked[0][1] if ranked else ""
+
+    if provider == "paypal":
+        for item in candidates:
+            method_id = custom_payment_method_identifier(item)
+            if "paypal" in custom_payment_method_text(item):
+                return method_id
+
+    if provider == "gcash":
+        for item in candidates:
+            method_id = custom_payment_method_identifier(item)
+            if "gcash" in custom_payment_method_text(item):
+                return method_id
+        return custom_payment_method_identifier(candidates[0])
+
+    return custom_payment_method_identifier(candidates[0])
+
+
+def checkout_redirect_url_from_payload(payload: Any) -> str:
+    candidates: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_lower = str(key).lower()
+                if isinstance(item, str) and item.startswith(("http://", "https://")):
+                    if any(token in key_lower for token in ("url", "redirect", "return", "hosted")):
+                        candidates.append(item.strip())
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(payload)
+    for candidate in candidates:
+        host = urlsplit(candidate).netloc.lower()
+        text = candidate.lower()
+        if any(marker in host or marker in text for marker in ("kakao", "nicepay", "stripe", "payment", "checkout")):
+            return candidate
+    return candidates[0] if candidates else ""
+
+
+def create_stripe_confirmation_token(
+    http,
+    pk: str,
+    payment_method_type: str,
+    billing: dict[str, Any],
+    return_url: str,
+    log,
+) -> str:
+    addr = dict((billing or {}).get("address") or {})
+    runtime_version = getattr(sc, "DEFAULT_STRIPE_RUNTIME_VERSION", "3.10.0")
+    data = {
+        "payment_method_data[type]": payment_method_type,
+        "payment_method_data[billing_details][name]": str((billing or {}).get("name") or ""),
+        "payment_method_data[billing_details][email]": str((billing or {}).get("email") or ""),
+        "payment_method_data[billing_details][address][country]": str(addr.get("country") or ""),
+        "payment_method_data[billing_details][address][line1]": str(addr.get("line1") or ""),
+        "payment_method_data[billing_details][address][line2]": str(addr.get("line2") or ""),
+        "payment_method_data[billing_details][address][city]": str(addr.get("city") or ""),
+        "payment_method_data[billing_details][address][state]": str(addr.get("state") or ""),
+        "payment_method_data[billing_details][address][postal_code]": str(addr.get("postal_code") or ""),
+        "payment_method_data[payment_user_agent]": (
+            f"stripe.js/{runtime_version}; stripe-js-v3/{runtime_version}; "
+            "payment-element; deferred-intent"
+        ),
+        "payment_method_data[referrer]": "https://chatgpt.com",
+        "payment_method_data[time_on_page]": str(random.randint(25000, 55000)),
+        "return_url": return_url,
+        "key": pk,
+        "_stripe_version": sc.STRIPE_VERSION_FULL,
+    }
+    data = {key: value for key, value in data.items() if value not in (None, "")}
+    resp = http.post(
+        f"{sc.STRIPE_API}/v1/confirmation_tokens",
+        data=data,
+        headers=sc._stripe_headers(),
+        timeout=45,
+    )
+    text = getattr(resp, "text", "") or ""
+    if getattr(resp, "status_code", 0) != 200:
+        raise RuntimeError(
+            f"创建 {payment_method_type} confirmation_token 失败 "
+            f"[{getattr(resp, 'status_code', '?')}]: {text[:500]}"
+        )
+    try:
+        payload = resp.json() or {}
+    except Exception as exc:
+        raise RuntimeError(f"创建 {payment_method_type} confirmation_token 返回非 JSON：{text[:300]}") from exc
+    token_id = str(payload.get("id") or "").strip()
+    if not token_id.startswith(("ctoken_", "ct_")):
+        raise RuntimeError(f"创建 {payment_method_type} confirmation_token 未返回 token id：{text[:300]}")
+    log(f"[stripe] {payment_method_type} confirmation_token: {token_id[:18]}...")
+    return token_id
+
+
+def custom_checkout_confirm_body(
+    session_id: str,
+    payment_method_type: str,
+    confirmation_token: str = "",
+) -> dict[str, str]:
+    body = {
+        "checkout_session_id": session_id,
+        "selected_payment_method_type": payment_method_type,
+    }
+    if confirmation_token:
+        body["confirm_token"] = confirmation_token
+    return body
+
+
 def confirm_custom_checkout_method(
     http,
     token: str,
@@ -1153,17 +1445,20 @@ def confirm_custom_checkout_method(
     use_sen: bool = True,
     use_so: bool = True,
     method_name: str = "GCash",
+    confirmation_token: str = "",
 ) -> dict[str, Any]:
     sentinel = asyncio.run(sentinel_headers(
         proxy, "checkout_session_approval", device_id, did,
         use_sen=use_sen, use_so=use_so,
     ))
+    body = custom_checkout_confirm_body(
+        session_id,
+        custom_payment_method_id,
+        confirmation_token,
+    )
     resp = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/confirm",
-        json={
-            "checkout_session_id": session_id,
-            "selected_payment_method_type": custom_payment_method_id,
-        },
+        json=body,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -1188,7 +1483,9 @@ def confirm_custom_checkout_method(
     if str(payload.get("status") or "").lower() != "success":
         status = str(payload.get("status") or "unknown").lower()
         if status == "blocked":
-            raise RuntimeError(f"CUSTOM_CONFIRM_BLOCKED: {method_name} 支付方式确认被上游拦截")
+            raise RuntimeError(
+                f"CUSTOM_CONFIRM_BLOCKED: {method_name} 支付方式确认被上游拦截；{text[:300]}"
+            )
         raise RuntimeError(f"确认 {method_name} 支付方式失败：status={status}；{text[:300]}")
     return payload
 
@@ -1200,6 +1497,8 @@ def start_custom_checkout_method(
     processor_entity: str,
     custom_payment_method_id: str,
     device_id: str,
+    *,
+    method_name: str = "GCash",
 ) -> dict[str, Any]:
     resp = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/custom_payment_method/start",
@@ -1222,14 +1521,14 @@ def start_custom_checkout_method(
     )
     text = resp.text or ""
     if resp.status_code != 200:
-        raise RuntimeError(f"启动 GCash 支付失败：HTTP {resp.status_code} {text[:300]}")
+        raise RuntimeError(f"启动 {method_name} 支付失败：HTTP {resp.status_code} {text[:300]}")
     try:
         payload = resp.json() or {}
     except Exception:
-        raise RuntimeError(f"启动 GCash 支付返回非 JSON：{text[:300]}")
+        raise RuntimeError(f"启动 {method_name} 支付返回非 JSON：{text[:300]}")
     action = payload.get("next_action") or {}
     if str(payload.get("status") or "").lower() != "requires_action" or not action.get("url"):
-        raise RuntimeError(f"GCash 未返回跳转链接：{text[:300]}")
+        raise RuntimeError(f"{method_name} 未返回跳转链接：{text[:300]}")
     return payload
 
 
@@ -2372,7 +2671,7 @@ class JobStore:
                 )
             )
             self.update(job_id, percent=34, text=stage2_text)
-            checkout_proxy = exit_proxy if provider in {"paypal", "upi", "ideal", "twint"} else entry_proxy
+            checkout_proxy = checkout_proxy_for_provider(provider, entry_proxy, exit_proxy)
             if provider in {"pix", "momo"}:
                 self.log(
                     job_id,
@@ -2389,6 +2688,8 @@ class JobStore:
                 self.log(job_id, "iDEAL 设置：代理池 2 创建 NL/EUR Checkout，并贯穿 Stripe 支付处理")
             elif provider == "twint":
                 self.log(job_id, "TWINT 设置：代理池 2 使用 CH 创建 CHF Checkout；可在支付方式确认后应用首月优惠")
+            elif provider == "kakao":
+                self.log(job_id, "Kakao 设置：代理池 1 用于优惠检查，代理池 2 创建 KR/KRW Checkout 并处理 Kakao Pay")
             elif provider != "hosted":
                 self.log(job_id, f"Checkout 将使用所选的 {country} 地区代理")
             created = create_checkout(
@@ -2414,8 +2715,9 @@ class JobStore:
                 self.log(job_id, f"Checkout 已返回活动标识：{stage1_campaign}")
             provider_chatgpt_http = chatgpt_http
             promo_chatgpt_http = chatgpt_http
-            if provider in {"paypal", "upi", "ideal", "twint", "gcash"}:
-                promo_chatgpt_http = sc.build_http(exit_proxy if provider == "gcash" else entry_proxy)
+            if provider in {"paypal", "upi", "ideal", "twint", "gcash", "kakao"}:
+                promo_proxy = promo_proxy_for_provider(provider, entry_proxy, exit_proxy)
+                promo_chatgpt_http = sc.build_http(promo_proxy)
                 try:
                     promo_chatgpt_http.cookies.set("oai-did", did, domain="chatgpt.com")
                     for cookie_name, cookie_value in chatgpt_http.cookies.get_dict().items():
@@ -2435,6 +2737,8 @@ class JobStore:
                     self.log(job_id, "UPI 支付处理使用代理池 2（IN）")
                 elif provider == "ideal":
                     self.log(job_id, "iDEAL 优惠更新使用代理池 1，NL/EUR Checkout 与 Stripe 使用代理池 2")
+                elif provider == "kakao":
+                    self.log(job_id, "Kakao 优惠更新使用代理池 1（VN），KR/KRW Checkout 与 Kakao Pay 使用代理池 2")
                 else:
                     self.log(job_id, "TWINT 支付处理使用代理池 2（CH/CHF）")
             session_id = checkout_data.get("checkout_session_id") or ""
@@ -2613,6 +2917,194 @@ class JobStore:
                         )
                     self.update(job_id, percent=100, text="GCash 跳转链接生成完成", status="done", result=result)
                     return
+                if provider == "kakao":
+                    self.update(job_id, percent=58, text="正在读取 OAICS Kakao Pay 支付方式")
+                    custom_state = fetch_custom_checkout_session(
+                        chatgpt_http, token, session_id, custom_processor, device_id,
+                    )
+                    initial_methods = extract_custom_checkout_methods(custom_state)
+                    custom_method_id = select_custom_checkout_method(initial_methods, "kakao")
+                    for method_poll in range(1, 4):
+                        if custom_method_id:
+                            break
+                        time.sleep(0.8 * method_poll)
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                        initial_methods = extract_custom_checkout_methods(custom_state)
+                        custom_method_id = select_custom_checkout_method(initial_methods, "kakao")
+                        method_state = "已获取" if custom_method_id else "待同步"
+                        self.log(job_id, f"Kakao Pay 支付方式同步检查 {method_poll}/3：{method_state}")
+
+                    custom_amount = custom_checkout_amount_minor(custom_state)
+                    custom_currency = custom_checkout_currency(custom_state) or "KRW"
+                    custom_update: dict[str, Any] = {}
+                    if promo_requested and custom_amount not in {None, 0}:
+                        self.update(job_id, percent=66, text="正在为 OAICS Kakao Pay 应用优惠")
+                        custom_update = update_checkout_promo(
+                            promo_chatgpt_http, token, session_id, custom_processor,
+                            options.get("promo_campaign") or "plus-1-month-free",
+                            lambda m: self.log(job_id, m), device_id=device_id,
+                        )
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                        if not initial_methods:
+                            initial_methods = extract_custom_checkout_methods(custom_update)
+                        custom_amount = custom_checkout_amount_minor(custom_state)
+                        custom_currency = custom_checkout_currency(custom_state) or custom_currency
+
+                    kakao_geo = payment_geo if str((payment_geo or {}).get("country") or "").upper() == "KR" else None
+                    kakao_billing = default_billing("KR", meta.get("email") or "", geo=kakao_geo)
+                    kakao_address = kakao_billing.get("address") or {}
+                    self.update(job_id, percent=72, text="正在提交 KR 账单地址")
+                    self.log(
+                        job_id,
+                        "Kakao KR 账单：name={}，city={}，state={}，postal={}，source={}".format(
+                            kakao_billing.get("name") or "-",
+                            kakao_address.get("city") or "-",
+                            kakao_address.get("state") or "-",
+                            kakao_address.get("postal_code") or "-",
+                            kakao_billing.get("_address_source") or "fallback",
+                        ),
+                    )
+                    tax_checkout = submit_custom_checkout_taxes(
+                        chatgpt_http, token, session_id, custom_processor,
+                        kakao_billing, custom_currency, device_id,
+                    )
+                    if tax_checkout:
+                        custom_state = tax_checkout
+                    else:
+                        custom_state = fetch_custom_checkout_session(
+                            chatgpt_http, token, session_id, custom_processor, device_id,
+                        )
+                    custom_amount = custom_checkout_amount_minor(custom_state)
+                    custom_currency = custom_checkout_currency(custom_state) or custom_currency
+                    custom_methods = extract_custom_checkout_methods(custom_state) or initial_methods
+                    custom_method_id = select_custom_checkout_method(custom_methods, "kakao")
+                    if not custom_method_id:
+                        method_summary = custom_payment_method_summary(custom_methods or custom_state)
+                        suffix = f"；候选={method_summary}" if method_summary else ""
+                        raise RuntimeError(
+                            "KAKAO_METHOD_UNAVAILABLE: 当前 KR Checkout 尚未返回 Kakao Pay 支付方式"
+                            f"{suffix}，将更换代理重建"
+                        )
+                    self.log(job_id, f"Kakao Pay 支付方式已选中：{custom_method_id}")
+                    if promo_requested and custom_amount not in {None, 0}:
+                        raise RuntimeError(f"OAICS Kakao Pay 优惠未生效：amount={custom_amount} {custom_currency}")
+
+                    confirmed: dict[str, Any] = {}
+                    started: dict[str, Any] = {}
+                    redirect_url = ""
+                    payment_method_type = "kakao_pay"
+                    self.update(job_id, percent=78, text="正在确认 Kakao Pay 支付方式")
+                    if custom_checkout_method_is_custom(custom_method_id):
+                        try:
+                            confirmed = confirm_custom_checkout_method(
+                                chatgpt_http, token, session_id, custom_processor,
+                                custom_method_id, exit_proxy, device_id, did,
+                                use_sen=bool(options.get("use_sen", True)),
+                                use_so=bool(options.get("use_so", True)),
+                                method_name="Kakao Pay",
+                            )
+                        except RuntimeError as confirm_error:
+                            if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
+                                raise
+                            self.log(job_id, "Kakao Pay confirm 首次被拦截，更新 SEN/SO 后重试")
+                            time.sleep(1.2)
+                            confirmed = confirm_custom_checkout_method(
+                                chatgpt_http, token, session_id, custom_processor,
+                                custom_method_id, exit_proxy, device_id, did,
+                                use_sen=True, use_so=True, method_name="Kakao Pay",
+                            )
+
+                        self.update(job_id, percent=88, text="正在生成 Kakao Pay 跳转链接")
+                        started = start_custom_checkout_method(
+                            chatgpt_http, token, session_id, custom_processor,
+                            custom_method_id, device_id, method_name="Kakao Pay",
+                        )
+                        action = started.get("next_action") or {}
+                        redirect_url = str(action.get("url") or "").strip()
+                        payment_method_type = (
+                            str(action.get("paymentMethodType") or action.get("payment_method_type") or "")
+                            or "kakao_pay"
+                        )
+                    else:
+                        publishable_key = (
+                            str(custom_state.get("publishable_key") or "")
+                            or str((custom_state.get("checkout_session") or {}).get("publishable_key") or "")
+                            or str(custom_update.get("publishable_key") or "")
+                            or str((custom_update.get("checkout_session") or {}).get("publishable_key") or "")
+                            or str(checkout_data.get("publishable_key") or "")
+                        )
+                        if not publishable_key:
+                            raise RuntimeError("Kakao Pay 原生确认失败：Checkout 未返回 publishable_key")
+                        return_url = f"https://chatgpt.com/checkout/{custom_processor}/{session_id}"
+                        self.log(job_id, f"Kakao Pay 使用原生 confirmation_token 流程：{custom_method_id}")
+                        confirmation_token_id = create_stripe_confirmation_token(
+                            chatgpt_http,
+                            publishable_key,
+                            custom_method_id,
+                            kakao_billing,
+                            return_url,
+                            lambda m: self.log(job_id, m),
+                        )
+                        try:
+                            confirmed = confirm_custom_checkout_method(
+                                chatgpt_http, token, session_id, custom_processor,
+                                custom_method_id, exit_proxy, device_id, did,
+                                use_sen=bool(options.get("use_sen", True)),
+                                use_so=bool(options.get("use_so", True)),
+                                method_name="Kakao Pay",
+                                confirmation_token=confirmation_token_id,
+                            )
+                        except RuntimeError as confirm_error:
+                            if "CUSTOM_CONFIRM_BLOCKED" not in str(confirm_error):
+                                raise
+                            self.log(job_id, "Kakao Pay 原生 confirm 首次被拦截，更新 SEN/SO 后重试")
+                            time.sleep(1.2)
+                            confirmed = confirm_custom_checkout_method(
+                                chatgpt_http, token, session_id, custom_processor,
+                                custom_method_id, exit_proxy, device_id, did,
+                                use_sen=True, use_so=True, method_name="Kakao Pay",
+                                confirmation_token=confirmation_token_id,
+                            )
+                        redirect_url = checkout_redirect_url_from_payload(confirmed)
+                        if not redirect_url:
+                            try:
+                                refreshed_state = fetch_custom_checkout_session(
+                                    chatgpt_http, token, session_id, custom_processor, device_id,
+                                )
+                                redirect_url = checkout_redirect_url_from_payload(refreshed_state)
+                            except Exception as exc:
+                                self.log(job_id, f"Kakao Pay confirm 后刷新提示：{type(exc).__name__}")
+                        payment_method_type = custom_method_id
+
+                    if not redirect_url:
+                        raise RuntimeError(
+                            "Kakao Pay 未返回跳转链接："
+                            + json.dumps(confirmed or started, ensure_ascii=False)[:500]
+                        )
+
+                    result.update({
+                        "link_type": "kakao",
+                        "checkout_provider": "open_ai_oaics",
+                        "processor_entity": custom_processor,
+                        "custom_payment_method_id": custom_method_id,
+                        "payment_method_type": payment_method_type,
+                        "provider_redirect_url": redirect_url,
+                        "short_link": redirect_url,
+                        "checkout_url": redirect_url,
+                        "verification_url": str(confirmed.get("confirm_return_url") or ""),
+                        "checkout_amount": custom_amount,
+                        "amount_currency": custom_currency,
+                        "amount_verification": "verified_zero" if custom_amount == 0 else ("pending" if custom_amount is None else "nonzero"),
+                        "promo_applied": ((custom_amount == 0) if promo_requested and custom_amount is not None else None),
+                        "oaics_kakao": True,
+                        "expires_at": int(time.time()) + 1800,
+                    })
+                    self.update(job_id, percent=100, text="Kakao Pay 跳转链接生成完成", status="done", result=result)
+                    return
                 if provider == "paypal":
                     self.update(job_id, percent=58, text="正在读取 OAICS PayPal 支付方式")
                     custom_state = fetch_custom_checkout_session(
@@ -2717,9 +3209,9 @@ class JobStore:
                     self.update(job_id, percent=100, text="OAICS PayPal 跳转链接生成完成", status="done", result=result)
                     return
                 if provider != "hosted":
-                    raise RuntimeError(
-                        f"CUSTOM_CHECKOUT_REBUILD_REQUIRED: received {session_id}; "
-                        f"{provider} requires a Stripe cs_* checkout"
+                    self.log(
+                        job_id,
+                        f"{provider.upper()} 当前仅返回 OAICS；自动改为官方 Checkout 链",
                     )
                 custom_processor = (
                     str(checkout_data.get("processor_entity") or "").strip()
@@ -3040,6 +3532,8 @@ class JobStore:
                     self.log(job_id, "iDEAL 已确认可用，正在通过代理池 1 提交优惠；最终以 Stripe 今日应付金额为准")
                 elif provider == "twint":
                     self.log(job_id, "TWINT 已确认可用，正在应用首月优惠并校验 CHF 今日应付金额")
+                elif provider == "kakao":
+                    self.log(job_id, "Kakao Pay 已确认可用，正在通过代理池 1 应用首月优惠")
                 advance_progress(70, "正在应用优惠")
                 campaign = options.get("promo_campaign") or "plus-1-month-free"
                 response = update_checkout_promo(
@@ -3072,7 +3566,7 @@ class JobStore:
                 # 卡住时，额外 Sentinel 上下文会让批准结果与 Stripe
                 # submission 不同步。
                 approve_callback=None if provider == "paypal" else approve_cb,
-                apply_promo_callback=apply_promo_cb if provider in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"} and promo_requested else None,
+                apply_promo_callback=apply_promo_cb if provider in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint", "kakao"} and promo_requested else None,
                 ideal_bank=options.get("ideal_bank", ""),
                 require_zero_due=promo_requested,
                 local_method_strategy=options.get("local_method_strategy") or "standalone",
@@ -3331,8 +3825,19 @@ def start_checkout():
         "use_so": data.get("use_so", True) is not False,
         "dynamic_proxy_api": dynamic_proxy_api,
         "allow_missing_customer_session": bool(data.get("allow_missing_customer_session")) and internal_request,
-        "entry_proxy_country": str(data.get("entry_proxy_country") or ("US" if link_type in {"gcash", "ph_short"} and country == "PH" else country)).upper(),
-        "exit_proxy_country": str(data.get("exit_proxy_country") or (str(data.get("promo_country") or "VN") if link_type == "gcash" else ((str(data.get("promo_country") or ("TR" if country == "PH" else country))) if link_type == "ph_short" and bool(data.get("use_promo", True)) else country))).upper(),
+        "entry_proxy_country": str(
+            data.get("entry_proxy_country")
+            or default_entry_proxy_country(link_type, country)
+        ).upper(),
+        "exit_proxy_country": str(
+            data.get("exit_proxy_country")
+            or default_exit_proxy_country(
+                link_type,
+                country,
+                str(data.get("promo_country") or ""),
+                bool(data.get("use_promo", True)),
+            )
+        ).upper(),
         "proxy_session_time": min(120, max(1, int(data.get("proxy_session_time") or 10))),
     }
     if link_type == "ph_short":

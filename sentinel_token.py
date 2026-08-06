@@ -621,22 +621,25 @@ def _run_vm_bundle_via_node(chat_req: dict, xor_key: str, flow: str = "oauth_cre
         )
 
         # 从输出中提取 JSON_OUTPUT
-        output = result.stdout
+        output = result.stdout or ""
+        stderr = result.stderr or ""
+        if result.returncode != 0:
+            detail = (stderr or output).strip().replace("\r", " ").replace("\n", " ")
+            raise RuntimeError(f"Sentinel Node VM failed ({result.returncode}): {detail[:500]}")
+
         marker = "=== JSON_OUTPUT ==="
         if marker in output:
             json_str = output[output.index(marker) + len(marker):].strip()
             data = json.loads(json_str)
             return data if isinstance(data, dict) else None
-        else:
-            if result.stderr:
-                print(f"    [SENTINEL] Node.js stderr: {result.stderr[:200]}")
-            return None
-    except subprocess.TimeoutExpired:
-        print("    [SENTINEL] Node.js VM timeout")
-        return None
-    except Exception as e:
-        print(f"    [SENTINEL] Node.js VM error: {e}")
-        return None
+        detail = (stderr or output).strip().replace("\r", " ").replace("\n", " ")
+        raise RuntimeError(f"Sentinel Node VM did not emit JSON_OUTPUT: {detail[:500]}")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Sentinel Node VM timeout") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Sentinel Node VM could not start: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Sentinel Node VM emitted invalid JSON: {exc}") from exc
     finally:
         try:
             os.unlink(input_file)

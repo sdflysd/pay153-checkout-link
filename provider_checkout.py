@@ -23,7 +23,16 @@ PROVIDER_DEFAULTS = {
     "momo": {"country": "VN", "currency": "VND"},
     "gcash": {"country": "PH", "currency": "PHP"},
     "twint": {"country": "CH", "currency": "CHF"},
+    "kakao": {"country": "KR", "currency": "KRW"},
 }
+STRIPE_PAYMENT_METHOD_ALIASES = {
+    "kakao": "kakao_pay",
+}
+
+
+def stripe_payment_method_type(provider: str) -> str:
+    provider = str(provider or "").lower()
+    return STRIPE_PAYMENT_METHOD_ALIASES.get(provider, provider)
 
 # PIX Automático / UPI AutoPay mandate_options were added after the Checkout
 # Payment Page version currently returned by this merchant.  Use the current
@@ -1107,6 +1116,7 @@ def stripe_to_provider(
     log: Callable[[str], None] = lambda m: None,
 ) -> dict[str, Any]:
     provider = provider.lower()
+    stripe_provider = stripe_payment_method_type(provider)
     local_method_strategy = str(local_method_strategy or "standalone").lower()
     late_promo = provider in {"pix", "upi", "momo"} and local_method_strategy == "late_promo"
     stage1 = stage1 or {}
@@ -1146,8 +1156,9 @@ def stripe_to_provider(
     pk = str(stage1.get("publishable_key") or "") or sc.verify_pk(http, session_id, log)
     init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
     methods = ctx.get("payment_method_types") or []
-    if provider not in methods:
-        raise RuntimeError(f"当前 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
+    if stripe_provider not in methods:
+        label = f"{provider}/{stripe_provider}" if stripe_provider != provider else provider
+        raise RuntimeError(f"当前 checkout 未开放 {label}，可用方式：{', '.join(methods) or 'card'}")
     sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
     processor = str(stage1.get("processor_entity") or "") or sc._entity_from_return_url(ctx.get("return_url") or init_data.get("return_url") or "") or "openai_llc"
     if apply_promo_callback and not late_promo:
@@ -1165,8 +1176,9 @@ def stripe_to_provider(
             init_data, version, ctx = sc.init_checkout(http, session_id, pk, profile, log)
             ctx["original_checkout_amount"] = original_checkout_amount
             methods = ctx.get("payment_method_types") or []
-            if provider not in methods:
-                raise RuntimeError(f"应用优惠后 checkout 未开放 {provider}，可用方式：{', '.join(methods) or 'card'}")
+            if stripe_provider not in methods:
+                label = f"{provider}/{stripe_provider}" if stripe_provider != provider else provider
+                raise RuntimeError(f"应用优惠后 checkout 未开放 {label}，可用方式：{', '.join(methods) or 'card'}")
             sc.fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
     if provider == "pix" and require_zero_due and not late_promo:
         original_checkout_amount = ctx.get("original_checkout_amount")
@@ -1237,7 +1249,7 @@ def stripe_to_provider(
     elif provider in {"pix", "upi", "momo", "twint"}:
         log(f"[stripe] {provider} 本轮使用 {local_method_strategy} inline PaymentMethod 提交")
     confirm = confirm_provider_payment(
-        http, pk, session_id, provider, init_data, version, ctx, profile, log,
+        http, pk, session_id, stripe_provider, init_data, version, ctx, profile, log,
         ideal_bank=ideal_bank,
         payment_method_id=payment_method_id,
     )
@@ -1263,7 +1275,9 @@ def stripe_to_provider(
                 ctx["payment_method_id"] = cand
                 log(f"[{provider}] 从 confirm 回填 payment_method={cand}")
                 break
-    out = extract_provider_result(confirm, provider)
+    out = extract_provider_result(confirm, stripe_provider)
+    out["provider"] = provider
+    out["payment_method_type"] = stripe_provider
     if not out.get("provider_redirect_url") and not out.get("qr_image_png") and not out.get("qr_data"):
         sub = confirm.get("submission_attempt") or {}
         if sub.get("state") == "requires_approval" and approve_callback:
@@ -1293,7 +1307,9 @@ def stripe_to_provider(
                 ctx=ctx,
                 max_attempts=3,
             )
-            out = extract_provider_result(confirm, provider)
+            out = extract_provider_result(confirm, stripe_provider)
+            out["provider"] = provider
+            out["payment_method_type"] = stripe_provider
             decline = payment_decline(confirm)
             failure_detail = provider_failure_detail(confirm)
             if failure_detail:
@@ -1327,7 +1343,9 @@ def stripe_to_provider(
                     ctx,
                     log,
                 )
-                out = extract_provider_result(confirm, provider)
+                out = extract_provider_result(confirm, stripe_provider)
+                out["provider"] = provider
+                out["payment_method_type"] = stripe_provider
                 decline = payment_decline(confirm)
                 failure_detail = provider_failure_detail(confirm)
                 if failure_detail:
