@@ -129,6 +129,12 @@ textarea::placeholder,input::placeholder{color:#9ba3b5}
 select{cursor:pointer}
 .token-field textarea{min-height:142px;resize:vertical;font:12px/1.7 var(--mono);background:linear-gradient(145deg,#f8f9fd,#f1f3f9)}
 .field-note,.inline-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.6}
+.token-account{display:flex;align-items:center;gap:9px;margin-top:10px;padding:10px 11px;border:1px solid rgba(28,168,121,.22);border-radius:13px;background:linear-gradient(90deg,rgba(28,168,121,.09),rgba(5,169,199,.045));font-size:11px}
+.token-account span{flex:none;color:#14835e;font-weight:900}
+.token-account code{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font:700 11px var(--mono)}
+.token-account button{flex:none;border:1px solid rgba(28,168,121,.28);border-radius:10px;padding:7px 10px;background:var(--surface);color:#14835e;font-size:10px;font-weight:900;cursor:pointer;transition:.18s}
+.token-account button:hover{transform:translateY(-1px);border-color:#14835e}
+.token-account button:disabled{cursor:not-allowed;opacity:.55;transform:none}
 .field-group{border:0;padding:0;margin:26px 0}
 .field-group legend{margin-bottom:11px;color:var(--muted);font:800 11px var(--display);letter-spacing:.08em;text-transform:uppercase}
 .choice-grid{display:grid;gap:10px}
@@ -191,6 +197,7 @@ select{cursor:pointer}
 
 .right-stack{display:grid;gap:24px;position:sticky;top:92px}
 .status-panel,.result-panel{padding:25px}
+.result-panel.promo-alerted:before{height:5px;background:linear-gradient(90deg,var(--danger),var(--warning))}
 .status-badge{padding:7px 10px;border-radius:99px;font-size:9px;font-weight:900;letter-spacing:.1em}
 .status-badge.idle{color:var(--muted);background:var(--surface-3)}
 .status-badge.queued{color:#b86a1c;background:rgba(245,158,66,.12)}
@@ -210,6 +217,12 @@ select{cursor:pointer}
 .seal{padding:6px 9px;border:1px solid var(--success);border-radius:999px;color:var(--success);font-size:9px;font-weight:900;letter-spacing:.13em}
 .qr-wrap{padding:18px;margin-bottom:16px;text-align:center;border:1px solid var(--line);border-radius:16px;background:white}.qr-wrap img{width:min(230px,100%);display:block;margin:auto}.qr-wrap span{display:block;margin-top:10px;color:#596478;font-size:11px}
 .result-list{border-top:1px solid var(--line)}.result-list>div{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--line);font-size:12px}.result-list span{color:var(--muted)}.result-list code{max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px}.result-link{margin-top:18px}.result-link textarea{min-height:105px;resize:vertical;font:11px/1.55 var(--mono)}
+.promo-danger{display:inline-flex;align-items:center;padding:5px 9px;border:1px solid rgba(220,82,96,.28);border-radius:999px;color:var(--danger);background:rgba(220,82,96,.10);font-size:11px}
+.result-alert{margin:16px 0 0;padding:15px 16px;border-radius:15px;font-size:12px;line-height:1.65}
+.result-alert b{display:block;margin-bottom:4px;font:900 12px var(--display);letter-spacing:.06em}
+.result-alert span{display:block}
+.promo-warning{border:1px solid rgba(220,82,96,.34);background:linear-gradient(135deg,rgba(220,82,96,.13),rgba(245,158,66,.10));color:#8d2530;box-shadow:0 14px 30px rgba(220,82,96,.12)}
+.promo-warning b{color:#b3313e}
 
 footer{width:min(1480px,100%);margin:0 auto;padding:24px 28px 40px;display:flex;justify-content:space-between;gap:20px;color:var(--muted);font-size:11px}footer span{color:var(--ink);font:800 11px var(--display);letter-spacing:.15em}footer p{margin:0}
 
@@ -237,12 +250,17 @@ textarea::-webkit-scrollbar-corner,.log-box::-webkit-scrollbar-corner{background
 .dark textarea:focus,.dark input:focus,.dark select:focus{background:#111b2b}
 .dark textarea::placeholder,.dark input::placeholder{color:#58667e}
 .dark .token-field textarea{background:linear-gradient(145deg,#0c1421,#101a29)}
+.dark .token-account{border-color:rgba(65,207,157,.25);background:linear-gradient(90deg,rgba(65,207,157,.10),rgba(40,194,221,.05))}
+.dark .token-account span,.dark .token-account button{color:var(--success)}
+.dark .token-account button{border-color:rgba(65,207,157,.28);background:#111a29}
 .dark .choice,.dark .rail{background:#111a29}
 .dark .choice:hover,.dark .rail:hover{background:#162133}
 .dark .choice.active,.dark .rail.active{background:linear-gradient(135deg,#7259f1,#4b32b5)}
 .dark .proxy-block{border-color:rgba(40,194,221,.22);background:linear-gradient(145deg,rgba(40,194,221,.075),rgba(138,114,255,.045) 68%,transparent)}
 .dark .proxy-foot button,.dark .secondary-button{background:#111a29}
 .dark .conditional-fields{background:rgba(138,114,255,.045)}
+.dark .promo-warning{color:#ffd2d7;background:linear-gradient(135deg,rgba(240,110,123,.17),rgba(242,166,87,.10));border-color:rgba(240,110,123,.36)}
+.dark .promo-warning b{color:#ff909b}
 .dark select option{background:#111a29;color:var(--ink)}
 .dark input:disabled,.dark select:disabled,.dark textarea:disabled{opacity:1;background:#0c1320;color:#718099;border-color:#253249}
 .dark .public-limit-note{color:#aeb7c8;background:linear-gradient(90deg,rgba(242,166,87,.09),rgba(242,166,87,.025))}

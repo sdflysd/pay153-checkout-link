@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>PAY.153 · 多通道提链控制台</title>
   <meta name="description" content="Hosted、PayPal、iDEAL、UPI、PIX、Kakao Pay、Team 与 Codex 空间提链工作台">
-  <link rel="stylesheet" href="/static/styles.css?v=20260728-momo-vn-1">
+  <link rel="stylesheet" href="/static/styles.css?v=20260807-token-email-1">
 </head>
 <body>
   <div class="paper-noise"></div>
@@ -50,6 +50,11 @@
         <label class="field token-field">
           <span class="label-row"><b>Access Token / Session JSON</b><small id="tokenHint">自动识别账号信息</small></span>
           <textarea id="token" name="token" required autocomplete="off" spellcheck="false" placeholder="粘贴 Access Token，或 chatgpt.com/api/auth/session 返回的 JSON"></textarea>
+          <span id="tokenAccount" class="token-account" aria-live="polite" hidden>
+            <span>账号邮箱</span>
+            <code id="tokenEmail">—</code>
+            <button id="copyTokenEmail" type="button" aria-label="复制账号邮箱">复制</button>
+          </span>
           <span class="field-note">内容不写入数据库，服务日志会自动隐藏 Token。</span>
         </label>
 
@@ -193,6 +198,10 @@
             <div><span>优惠状态</span><b id="resultPromo">—</b></div>
             <div><span>Session</span><code id="resultSession">—</code></div>
           </div>
+          <div id="promoWarning" class="result-alert promo-warning" hidden>
+            <b>优惠未生效</b>
+            <span id="promoWarningText">最终链接不是 0 元账单，请确认页面金额后再付款。</span>
+          </div>
           <label class="field result-link"><span>最终链接 / 付款码</span><textarea id="resultValue" readonly></textarea></label>
           <div class="result-actions"><a id="openResult" class="primary-button" target="_blank" rel="noopener noreferrer">打开长链</a><a id="verifyResult" class="secondary-button" target="_blank" rel="noopener noreferrer" hidden>条款页面</a><button id="copyResult" class="secondary-button" type="button">复制结果</button></div>
         </section>
@@ -201,6 +210,6 @@
   </main>
 
   <footer><span>PAY.153.INK</span><p>任务完成后请及时使用链接；支付提供商生成的二维码通常具有有效期。</p></footer>
-  <script src="/static/app.js?v=20260806-gcash-ph-checkout-1"></script>
+  <script src="/static/app.js?v=20260807-token-email-2"></script>
 </body>
 </html>

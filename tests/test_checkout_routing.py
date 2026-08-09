@@ -29,6 +29,7 @@ from app import (
     gcash_page_fallback_allowed,
     gcash_done_text,
     has_chatgpt_session_cookie,
+    is_non_retryable_checkout_error,
     merge_chrome_cdp_credentials,
     promo_proxy_for_provider,
     ProxySentinel,
@@ -114,6 +115,14 @@ async def fake_sentinel_headers(*_args, **_kwargs):
 
 
 class CheckoutProxyRoutingTests(unittest.TestCase):
+    def test_custom_confirm_blocked_is_not_retryable(self):
+        message = (
+            "CUSTOM_CONFIRM_BLOCKED: GCash 支付方式确认被上游拦截；"
+            "{\"status\":\"blocked\"}；Chrome fallback unavailable: connect ECONNREFUSED 127.0.0.1:9222"
+        )
+
+        self.assertTrue(is_non_retryable_checkout_error(message))
+
     def test_kakao_checkout_uses_exit_proxy(self):
         self.assertEqual(
             checkout_proxy_for_provider("kakao", "POOL1_VN", "POOL2_KR"),

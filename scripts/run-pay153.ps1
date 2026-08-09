@@ -17,6 +17,7 @@ $process = Start-Process `
     -FilePath $pythonExe `
     -ArgumentList @("app.py") `
     -WorkingDirectory $Root `
+    -WindowStyle Hidden `
     -RedirectStandardOutput $outLog `
     -RedirectStandardError $errLog `
     -PassThru

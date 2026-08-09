@@ -2869,10 +2869,7 @@ class JobStore:
                         last_retry_error=last_error[:500],
                     )
                     return
-            non_retryable = any(marker in lowered for marker in (
-                "access token", "token_invalidated", "token_expired", "token_revoked", "jwt expired",
-                "计划类型", "提取方式", "任务已停止",
-            ))
+            non_retryable = is_non_retryable_checkout_error(last_error)
             if non_retryable or attempt >= max_attempts:
                 self.update(job_id, status="error", percent=100, text="任务失败", error=last_error[:1200])
                 return
@@ -4704,6 +4701,23 @@ class JobStore:
                 error_text = "该账号已有其他币种的活跃结账会话，请等待原会话释放，或更换账号后再生成当前币种链接。"
             elif "amount_too_small" in lowered:
                 error_text = "当前地区换算后的结账金额低于支付提供商下限，请提高 Codex 积分数量后重试。"
+            elif "custom_confirm_blocked" in lowered:
+                payment_label = {
+                    "gcash": "GCash",
+                    "kakao": "Kakao Pay",
+                    "paypal": "PayPal",
+                    "upi": "UPI",
+                    "ideal": "iDEAL",
+                    "twint": "TWINT",
+                }.get(str(options.get("link_type") or "").lower(), "支付方式")
+                if "chrome fallback unavailable" in lowered or "chrome 9222" in lowered:
+                    error_text = (
+                        f"{payment_label} 确认被上游 blocked；当前没有可用的 Chrome 9222 浏览器上下文兜底。"
+                        "请使用包含 ChatGPT Cookie 的完整 Session JSON，或启动已登录 ChatGPT 的 "
+                        "Chrome --remote-debugging-port=9222 后重试。"
+                    )
+                else:
+                    error_text = f"{payment_label} 确认被上游 blocked；请优先使用包含 ChatGPT Cookie 的完整 Session JSON 后重试。"
             self.log(job_id, f"错误：{type(exc).__name__}: {error_text}")
             if options.get("retry_wrapper"):
                 self.update(job_id, status="running", percent=8, text="本次未成功，正在更换代理重试", error=error_text[:1200])

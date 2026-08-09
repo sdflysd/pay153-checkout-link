@@ -12,6 +12,7 @@ let progressLastTick = 0;
 let proxySaveTimer = 0;
 let logAutoFollow = true;
 let renderedLogKey = '';
+let parsedTokenEmail = '';
 
 const PROXY_STORAGE_KEYS = {
   entry: 'pay153.proxy_pool_1',
@@ -25,7 +26,122 @@ const providerDefaults = {
   ph_short: {country: 'PH', currency: 'PHP'}
 };
 const countryCurrency = {US:'USD',DE:'EUR',FR:'EUR',NL:'EUR',IN:'INR',BR:'BRL',VN:'VND',GB:'GBP',JP:'JPY',KR:'KRW',PH:'PHP',AU:'AUD',CA:'CAD'};
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+function jwtFromRawToken(value){
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const match = text.match(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+  return match ? match[0] : '';
+}
+function base64UrlJson(part){
+  try{
+    const base64 = String(part || '').replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+    const binary = atob(padded);
+    if (typeof TextDecoder !== 'undefined') {
+      const bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0));
+      return JSON.parse(new TextDecoder().decode(bytes));
+    }
+    const escaped = Array.from(binary, ch => `%${ch.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
+    return JSON.parse(decodeURIComponent(escaped));
+  }catch(error){
+    return null;
+  }
+}
+function emailFromJwt(token){
+  const jwt = jwtFromRawToken(token);
+  if (!jwt) return '';
+  const payload = base64UrlJson(jwt.split('.')[1]);
+  const email = payload && typeof payload.email === 'string' ? payload.email.trim() : '';
+  if (emailPattern.test(email)) return email;
+  return findEmailInPayload(payload);
+}
+function findEmailInPayload(value){
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return emailPattern.test(text) ? text : '';
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findEmailInPayload(item);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      if (String(key).toLowerCase().includes('email') && typeof item === 'string') {
+        const email = item.trim();
+        if (emailPattern.test(email)) return email;
+      }
+    }
+    for (const item of Object.values(value)) {
+      const found = findEmailInPayload(item);
+      if (found) return found;
+    }
+  }
+  return '';
+}
+function findTokenInPayload(value){
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findTokenInPayload(item);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      const normalized = String(key).toLowerCase();
+      if (typeof item === 'string' && ['accesstoken','access_token','token'].includes(normalized)) {
+        const token = jwtFromRawToken(item);
+        if (token) return token;
+      }
+    }
+    for (const item of Object.values(value)) {
+      const found = findTokenInPayload(item);
+      if (found) return found;
+    }
+  }
+  return '';
+}
+function tokenEmailFromRaw(raw){
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  try{
+    const payload = JSON.parse(text);
+    return emailFromJwt(findTokenInPayload(payload)) || findEmailInPayload(payload);
+  }catch(error){
+    return emailFromJwt(text);
+  }
+}
+function syncTokenEmail(){
+  parsedTokenEmail = tokenEmailFromRaw($('token').value);
+  $('tokenAccount').hidden = !parsedTokenEmail;
+  $('tokenEmail').textContent = parsedTokenEmail || '—';
+  $('copyTokenEmail').disabled = !parsedTokenEmail;
+  $('tokenHint').textContent = parsedTokenEmail ? '已解析邮箱' : ($('token').value.trim() ? '未解析到邮箱' : '自动识别账号信息');
+}
+async function copyText(value){
+  const text = String(value || '');
+  if (!text) return false;
+  try{
+    await navigator.clipboard.writeText(text);
+    return true;
+  }catch(error){
+    const node = document.createElement('textarea');
+    node.value = text;
+    node.setAttribute('readonly', '');
+    node.style.position = 'fixed';
+    node.style.opacity = '0';
+    document.body.appendChild(node);
+    node.select();
+    const ok = document.execCommand('copy');
+    node.remove();
+    return ok;
+  }
+}
 function proxyLines(node){
   return node.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
 }
@@ -116,6 +232,14 @@ function syncFields(applyRailDefault=false){
   }
 }
 $('country').addEventListener('change', () => $('currency').value = countryCurrency[$('country').value] || 'USD');
+$('token').addEventListener('input', syncTokenEmail);
+$('copyTokenEmail').addEventListener('click', async () => {
+  if (!parsedTokenEmail) return;
+  const old = $('copyTokenEmail').textContent;
+  const ok = await copyText(parsedTokenEmail);
+  $('copyTokenEmail').textContent = ok ? '已复制' : '复制失败';
+  setTimeout(() => $('copyTokenEmail').textContent = old, 1200);
+});
 $('usePromo').addEventListener('change', () => syncFields(false));
 $('entryProxy').addEventListener('input', () => { updateProxyCount($('entryProxy'), $('entryProxyCount')); saveProxyPools(); });
 $('exitProxy').addEventListener('input', () => { updateProxyCount($('exitProxy'), $('exitProxyCount')); saveProxyPools(); });
@@ -201,12 +325,52 @@ $('logBox').addEventListener('scroll', () => {
   logAutoFollow = box.scrollHeight - box.clientHeight - box.scrollTop < 28;
 });
 
+function resultAmountValue(result){
+  const amount = result.checkout_amount ?? result.amount ?? null;
+  if (amount === null || amount === undefined || amount === '') return null;
+  return amount;
+}
+function resultAmountCurrency(result){
+  return String(result.amount_currency || result.checkout_currency || result.currency || '').toUpperCase();
+}
+function amountIsNonZero(amount){
+  if (amount === null || amount === undefined || amount === '') return false;
+  const numeric = Number(amount);
+  if (Number.isFinite(numeric)) return numeric !== 0;
+  return !['0','0.0','0.00'].includes(String(amount).trim());
+}
+function promoWarningText(result){
+  const amount = resultAmountValue(result);
+  const currency = resultAmountCurrency(result);
+  const suffix = amount === null ? '' : `接口金额 amount=${amount}${currency ? ` ${currency}` : ''}。`;
+  return `最终链接不是 0 元账单，${suffix}请确认页面金额后再付款。`;
+}
+function promoWasRequested(result){
+  return result.promo_requested === true || result.use_promo === true;
+}
+function promoIsNonZero(result){
+  if (!promoWasRequested(result)) return false;
+  const verification = String(result.amount_verification || '').toLowerCase();
+  return result.promo_applied === false || verification === 'nonzero' || amountIsNonZero(resultAmountValue(result));
+}
+function promoStatusText(result, nonZeroPromo){
+  if (!promoWasRequested(result)) return '未请求';
+  if (nonZeroPromo) return '未生效 · 不是 0 元';
+  if (result.promo_applied === true) return '已生效 · 今日应付 0';
+  return '打开结账页确认';
+}
+
 function showResult(result){
   $('resultPanel').hidden = false;
   $('resultType').textContent = `${String(result.plan||'').toUpperCase()} · ${String(result.link_type||'').toUpperCase()}`;
   $('resultEmail').textContent = result.account_email || '—';
   $('resultRegion').textContent = `${result.country || '—'} / ${result.currency || '—'}`;
-  $('resultPromo').textContent = !result.promo_requested ? '未请求' : result.promo_applied === true ? '已生效 · 今日应付 0' : result.promo_applied === false ? '未生效' : '打开结账页确认';
+  const nonZeroPromo = promoIsNonZero(result);
+  $('resultPanel').classList.toggle('promo-alerted', nonZeroPromo);
+  $('resultPromo').textContent = promoStatusText(result, nonZeroPromo);
+  $('resultPromo').classList.toggle('promo-danger', nonZeroPromo);
+  $('promoWarning').hidden = !nonZeroPromo;
+  $('promoWarningText').textContent = nonZeroPromo ? promoWarningText(result) : '';
   $('resultSession').textContent = result.checkout_session_id || '—';
   const resultProvider = String(result.link_type || result.provider || '').toLowerCase();
   const isIdeal = resultProvider === 'ideal';
@@ -293,7 +457,7 @@ $('cancelButton').addEventListener('click', async () => {
     method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:jobId})
   });
 });
-$('copyResult').addEventListener('click', async () => { await navigator.clipboard.writeText($('resultValue').value || ''); const old=$('copyResult').textContent; $('copyResult').textContent='已复制'; setTimeout(()=>$('copyResult').textContent=old,1200); });
+$('copyResult').addEventListener('click', async () => { const ok = await copyText($('resultValue').value || ''); const old=$('copyResult').textContent; $('copyResult').textContent=ok?'已复制':'复制失败'; setTimeout(()=>$('copyResult').textContent=old,1200); });
 
 function applyTheme(dark){
   document.documentElement.classList.toggle('dark',dark);
@@ -318,6 +482,7 @@ if (privateMode) {
   if (rateCard) rateCard.innerHTML = '<small>PRIVATE LANE</small><strong>DIRECT</strong><span>独立执行池</span>';
 }
 syncFields(true);
+syncTokenEmail();
 restoreProxyPools();
 updateProxyCount($('entryProxy'), $('entryProxyCount'));
 updateProxyCount($('exitProxy'), $('exitProxyCount'));
